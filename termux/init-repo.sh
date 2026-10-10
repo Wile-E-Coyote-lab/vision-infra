@@ -5,7 +5,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . termux/lib.sh
 
-true  # installs handled by preflight
+# Best effort: preflight already verified the tools; install only what is missing.
+if command -v pkg >/dev/null 2>&1; then
+  for p in git curl jq gnupg; do
+    command -v "${p/gnupg/gpg}" >/dev/null 2>&1 || pkg install -y "$p" || echo "warn: could not install $p"
+  done
+fi
 REPO_NAME="${1:-vision-infra}"
 
 load_token

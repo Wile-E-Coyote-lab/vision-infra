@@ -3,7 +3,7 @@
 Flow: Termux -> GitHub (REST) -> Actions (OIDC/WIF, no keys) -> Terraform -> GCE (Ubuntu + Docker + Redroid) -> IAP tunnel -> adb from Termux.
 
 ## Runbook
-0. **Termux deps**: `pkg install git curl jq gnupg pinentry-curses`. Token (scopes: `repo`, `workflow`) must exist as `~/.config/github/token.gpg`.
+0. **Termux deps**: `pkg install git curl jq gnupg pinentry`. Token (scopes: `repo`, `workflow`) must exist as `~/.config/github/token.gpg`.
 1. **gcloud (proot)**: `pkg install proot-distro && proot-distro install debian && proot-distro login debian`, then
    `apt update && apt install -y curl python3 git jq android-tools-adb && curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts`
    and `gcloud auth login --no-launch-browser`. (Alternative: run step 3 in Cloud Shell.)
@@ -32,7 +32,7 @@ Flow: Termux -> GitHub (REST) -> Actions (OIDC/WIF, no keys) -> Terraform -> GCE
 ```
 bash install.sh                 # unpacks to ~/vision-infra (once)
 cd ~/vision-infra
-pkg install python git gh curl jq gnupg pinentry-curses android-tools
+pkg install python git gh curl jq gnupg pinentry android-tools
 python3 controller.py           # prompts for GPG passphrase, prints the dashboard URL
 ```
 The URL contains a per-run token (`?t=...`). It opens via `termux-open-url` when available; otherwise paste it into a phone browser. Alternatively `GH_PAT=... python3 controller.py` skips GPG.
@@ -58,3 +58,11 @@ Token scopes: `repo`, `workflow`, `codespace`. The controller keeps the token in
 - If `gcloud auth ... --no-launch-browser` changes its flow in a newer gcloud, the prompt regexes (`INTER` in `controller.py`) are the one place to adjust.
 - Verify the gcloud devcontainer feature ID resolves (`.devcontainer/devcontainer.json`); the **Wait for toolchain** step fails loudly if it doesn't.
 - Stop the Codespace when idle (`gh codespace stop`) and destroy the VM when finished: the dashboard's **Destroy** step.
+
+## Token handling (Boolean branch)
+The **Token scopes** step reads the token type from its prefix and branches:
+- `ghp_` classic: reads `X-OAuth-Scopes`, requires `repo workflow codespace`. If short, the card links to github.com/settings/tokens. Tick the scopes on the existing token and press **Done, re-check**. Editing a classic token keeps the same string, so nothing is re-encrypted and the controller keeps running.
+- `github_pat_`, `gho_`, `ghs_`: scopes are not readable, so the step warns and continues.
+- Any step that fails with `needs the "x" scope` reports it and re-opens **Token scopes** automatically.
+
+GitHub has no API to create or widen a PAT; this is the smallest human step possible.

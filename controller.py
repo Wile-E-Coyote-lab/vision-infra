@@ -58,6 +58,13 @@ INTER = {
     "prompt_re": r"(?i)(authorization code|verification code|\(Y/n\)|\[Y/n\])",
 }
 
+INTER_CONFIRM = {
+    "label": "GitHub token scopes",
+    "url_re": r"https://github\.com/settings/tokens\S*",
+    "prompt_re": r"Press Enter",
+    "confirm": True,  # dashboard shows a single 'Done, re-check' button instead of a text box
+}
+
 STEPS = [
     dict(id="preflight", title="Preflight", runner="local", deps=[], needs=[],
          desc="Check Termux tools and that the GitHub token works.",
@@ -70,14 +77,57 @@ login="$(gh api user -q .login)"
 echo "GitHub token valid for: $login"
 echo "::set owner=$login"
 '''),
-    dict(id="repo", title="Create + push repo", runner="local", deps=["preflight"], needs=["owner"], once=True,
+    dict(id="token_scopes", title="Token scopes", runner="local", deps=["preflight"], needs=[],
+         interaction=INTER_CONFIRM,
+         desc="Boolean token handling: classic token -> verify scopes, edit in place if short; other types -> warn and continue.",
+         check=r'''case "$GH_TOKEN" in ghp_*) ;; *) exit 0;; esac
+h="$(gh api -i user 2>/dev/null | tr -d '\r')"
+s="$(printf '%s\n' "$h" | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}' | tr ',' '\n' | tr -d ' ')"
+for r in repo workflow codespace; do printf '%s\n' "$s" | grep -qx "$r" || exit 1; done''',
+         script=r'''
+REQUIRED="repo workflow codespace"
+case "$GH_TOKEN" in
+  ghp_*) kind=classic ;; github_pat_*) kind=fine-grained ;; gho_*) kind=oauth ;; ghs_*) kind=app ;; *) kind=unknown ;;
+esac
+echo "token type: $kind"
+if [ "$kind" != classic ]; then
+  echo "Scopes cannot be read from a $kind token, so they are not verified."
+  echo "If a later step reports a missing scope, switch to a classic token with: $REQUIRED"
+  exit 0
+fi
+scan() {
+  hdr="$(gh api -i user 2>/dev/null | tr -d '\r' || true)"
+  have="$(printf '%s\n' "$hdr" | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}' | tr ',' '\n' | tr -d ' ')"
+  missing=""
+  for r in $REQUIRED; do printf '%s\n' "$have" | grep -qx "$r" || missing="$missing $r"; done
+}
+for attempt in 1 2 3 4 5; do
+  scan
+  if [ -z "$missing" ]; then
+    echo "scopes OK: $REQUIRED"
+    extra="$(printf '%s\n' "$have" | grep -vxE 'repo|workflow|codespace' | grep -c . || true)"
+    [ "$extra" -gt 0 ] && echo "note: token carries $extra extra scope(s) the pipeline does not need"
+    exit 0
+  fi
+  echo "missing scopes:$missing"
+  echo "Editing a classic token keeps the same token string (no re-encrypt, no restart)."
+  echo "Alternative: prefilled new token https://github.com/settings/tokens/new?scopes=repo,workflow,codespace&description=vision-infra"
+  echo "Open your existing token, tick:$missing, then Update token:"
+  echo "https://github.com/settings/tokens"
+  echo "Press Enter here when done"
+  read -r _
+done
+echo "still missing:$missing"
+exit 1
+'''),
+    dict(id="repo", title="Create + push repo", runner="local", deps=["token_scopes"], needs=["owner"], once=True,
          desc="Create the private GitHub repo via REST and push this tree (one time).",
          check=r'''gh repo view "$GH_REPO" >/dev/null 2>&1''',
          script=r'''
 cd "$REPO_DIR"
 ./termux/init-repo.sh "$REPO_NAME"
 '''),
-    dict(id="codespace", title="Create Codespace", runner="local", deps=["repo"], needs=["owner"], once=True,
+    dict(id="codespace", title="Create Codespace", runner="local", deps=["repo", "token_scopes"], needs=["owner"], once=True,
          desc="Create (or reuse) the Codespace that acts as the control plane.",
          check=r'''n="$(gh codespace list -R "$GH_REPO" --json name -q '.[0].name' 2>/dev/null)"; [ -n "$n" ] && echo "::set cs_name=$n"''',
          script=r'''
@@ -398,7 +448,7 @@ def run_local(sid: str, s: dict):
     p, master = spawn_pty(["bash", "-c", "set -eo pipefail\n" + s["script"]], build_env(), str(ROOT))
     ACTIVE[sid] = {"proc": p, "master": master, "stopped": False}
     inter, svc = s.get("interaction"), s.get("service")
-    state = {"url": None, "waiting": False, "deadline": 0.0, "up": False}
+    state = {"url": None, "waiting": False, "deadline": 0.0, "up": False, "scope_miss": None}
     t0 = time.time()
 
     def handle(line: str):
@@ -410,13 +460,17 @@ def run_local(sid: str, s: dict):
             log(sid, "set " + line[6:], "ctl")
             return
         log(sid, line)
+        mm = re.search(r'needs the "([\w:]+)" scope', line)
+        if mm:
+            state["scope_miss"] = mm.group(1)
         if inter:
             m = re.search(inter["url_re"], line)
             if m:
                 state["url"] = m.group(0)
             if not state["waiting"] and re.search(inter["prompt_re"], line):
                 state["waiting"], state["deadline"] = True, time.time() + HITL_TIMEOUT
-                hitl = {"label": inter["label"], "url": state["url"], "prompt": redact(line)[:200], "since": time.time()}
+                hitl = {"label": inter["label"], "url": state["url"], "prompt": redact(line)[:200], "since": time.time(),
+                        "confirm": bool(inter.get("confirm"))}
                 set_status(sid, "awaiting_human", hitl=hitl)
                 log(sid, f"HITL requested: {inter['label']}", "hitl")
         if svc and not state["up"] and svc.get("ready_re") and re.search(svc["ready_re"], line):
@@ -477,7 +531,12 @@ def run_local(sid: str, s: dict):
         set_status(sid, "ok", exit=0, hitl=None)
     else:
         log(sid, f"step FAILED (exit {rc})", "ctl")
-        set_status(sid, "failed", exit=rc, hitl=None)
+        miss = state["scope_miss"]
+        note = f'Token lacks "{miss}" scope: run "Token scopes" again' if miss else ""
+        set_status(sid, "failed", exit=rc, hitl=None, note=note)
+        if miss and STORE.step("token_scopes")["status"] == "ok":
+            log("token_scopes", f'downstream step reported missing scope "{miss}"; re-opening', "ctl")
+            set_status("token_scopes", "pending", note=f'downstream needs "{miss}"')
 
 
 # --------------------------------------------------------------------------- codespace (detached) runner
@@ -830,7 +889,7 @@ def load_token() -> str:
         sys.exit(f"No token: export GH_PAT or create {f} (gpg-encrypted PAT: repo, workflow, codespace scopes).")
     gnupg = Path.home() / ".gnupg"
     gnupg.mkdir(mode=0o700, exist_ok=True)
-    pin = shutil.which("pinentry-curses")
+    pin = shutil.which("pinentry-curses") or shutil.which("pinentry")
     conf = gnupg / "gpg-agent.conf"
     if pin and "pinentry-program" not in (conf.read_text() if conf.exists() else ""):
         with open(conf, "a") as fh:

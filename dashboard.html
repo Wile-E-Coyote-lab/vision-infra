@@ -132,7 +132,8 @@ function buildCard(s, idx) {
   const send = el('button', 'primary', 'Send');
   const copy = el('button', '', 'Copy link');
   row.append(inp, send);
-  hitl.append(hl, link, el('div'), copy, row);
+  const done = el('button', 'primary', 'Done, re-check'); done.onclick = () => act(`/api/steps/${s.id}/input`, {text: 'ok'});
+  hitl.append(hl, link, el('div'), copy, row, done);
   const btns = el('div', 'btns');
   const run = el('button', 'primary', 'Run');
   const stop = el('button', '', 'Stop');
@@ -157,7 +158,7 @@ function buildCard(s, idx) {
   send.onclick = doSend;
   inp.onkeydown = e => { if (e.key === 'Enter') doSend(); };
   copy.onclick = () => { const u = S[s.id].hitl && S[s.id].hitl.url; if (u && navigator.clipboard) navigator.clipboard.writeText(u).then(() => toast('Link copied')); };
-  cards[s.id] = {root: c, pill, note, hitl, hl, link, run, stop, reat, pre, inp, copy};
+  cards[s.id] = {root: c, pill, note, hitl, hl, link, run, stop, reat, pre, inp, copy, row, done};
   return c;
 }
 
@@ -178,7 +179,8 @@ function refreshAll() {
     const h = s.hitl;
     if (s.status === 'awaiting_human' && h) {
       c.hitl.classList.remove('hide');
-      c.hl.textContent = h.label + (h.url ? ' — open this link, sign in, then paste the code:' : ' — answer the prompt:');
+      c.hl.textContent = h.label + (h.confirm ? ' — open the link, tick the missing scopes, then confirm:' : (h.url ? ' — open this link, sign in, then paste the code:' : ' — answer the prompt:'));
+      c.row.classList.toggle('hide', !!h.confirm); c.done.classList.toggle('hide', !h.confirm);
       if (h.url && h.url.startsWith('https://')) { c.link.href = h.url; c.link.textContent = h.url; c.link.classList.remove('hide'); c.copy.classList.remove('hide'); }
       else { c.link.classList.add('hide'); c.copy.classList.add('hide'); }
       c.pre.classList.remove('hide');
