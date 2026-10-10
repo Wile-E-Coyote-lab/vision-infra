@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vision-infra controller</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--mut:#8b93a5;--ok:#3fb950;--run:#58a6ff;--warn:#d29922;--bad:#f85149;--acc:#6e7bff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h1{font-size:16px;margin:0;flex:1}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--bad);display:inline-block}
+.dot.on{background:var(--ok)}
+main{padding:10px 12px 60px;max-width:900px;margin:0 auto}
+button{background:#232838;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:14px}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button.danger{background:#5b1d1d;border-color:#7a2626}
+button:disabled{opacity:.4}
+input{background:#0c0e13;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px;font-size:14px;width:100%}
+.tabs{display:flex;gap:6px;margin:6px 0 10px}
+.tabs button.active{border-color:var(--acc);color:#fff}
+details.cfg{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin-bottom:10px}
+details.cfg summary{cursor:pointer;color:var(--mut)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.grid label{font-size:12px;color:var(--mut);display:block}
+.ro{font-size:12px;color:var(--mut);margin-top:6px;word-break:break-all}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:10px}
+.card.running{border-color:var(--run)}.card.awaiting_human{border-color:var(--warn)}.card.failed{border-color:var(--bad)}
+.card header{position:static;background:none;border:0;padding:0}
+.card h3{margin:0;font-size:15px;flex:1}
+.badge{font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin-left:6px}
+.pill{font-size:12px;border-radius:999px;padding:2px 10px;background:#262b36;color:var(--mut)}
+.pill.ok,.pill.up{background:#12301b;color:var(--ok)}
+.pill.running{background:#11284a;color:var(--run)}
+.pill.awaiting_human,.pill.detached{background:#3a2c0a;color:var(--warn)}
+.pill.failed{background:#3b1414;color:var(--bad)}
+.desc{color:var(--mut);margin:6px 0;font-size:13px}
+.btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.hitl{border:1px dashed var(--warn);border-radius:8px;padding:8px;margin:8px 0;background:#1d1807}
+.hitl a{color:var(--warn);word-break:break-all}
+.hitl .row{display:flex;gap:6px;margin-top:6px}
+pre.log{background:#0a0c10;border:1px solid var(--line);border-radius:8px;padding:8px;margin:8px 0 0;max-height:260px;overflow:auto;font:12px/1.35 ui-monospace,monospace;white-space:pre-wrap;word-break:break-word}
+pre.log .err{color:var(--bad)}pre.log .hitl{color:var(--warn)}pre.log .ctl{color:var(--run)}pre.log .tag{color:var(--acc)}
+#timeline{max-height:none;min-height:60vh}
+#toast{position:fixed;left:12px;right:12px;bottom:12px;background:#3b1414;border:1px solid var(--bad);border-radius:10px;padding:10px;display:none;z-index:9}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<header>
+  <h1>vision-infra controller</h1>
+  <span id="conn" class="dot" title="event stream"></span>
+  <button id="refresh">Refresh state</button>
+</header>
+<main>
+  <details class="cfg" id="cfg">
+    <summary>Configuration</summary>
+    <div class="grid">
+      <div><label>GCP project ID</label><input id="f_project_id" autocapitalize="off" autocomplete="off"></div>
+      <div><label>Zone</label><input id="f_zone" autocapitalize="off"></div>
+      <div><label>Repo name</label><input id="f_repo_name" autocapitalize="off"></div>
+      <div><label>VM name</label><input id="f_instance" autocapitalize="off"></div>
+      <div><label>Codespace machine</label><input id="f_cs_machine" autocapitalize="off"></div>
+      <div style="display:flex;align-items:flex-end"><button class="primary" id="saveCfg" style="width:100%">Save</button></div>
+    </div>
+    <div class="ro">owner: <b id="r_owner">-</b> &middot; codespace: <b id="r_cs">-</b></div>
+  </details>
+  <div class="tabs">
+    <button id="tabSteps" class="active">Steps</button>
+    <button id="tabTime">Timeline</button>
+  </div>
+  <div id="steps"></div>
+  <div id="timelineWrap" class="hide"><pre class="log" id="timeline"></pre></div>
+</main>
+<div id="toast"></div>
+<script>
+const P = new URLSearchParams(location.search);
+let T = P.get('t') || sessionStorage.getItem('vi_t') || '';
+sessionStorage.setItem('vi_t', T);
+if (P.get('t')) history.replaceState(null, '', location.pathname);
+
+const $ = (s, r = document) => r.querySelector(s);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
+
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: {'X-Token': T, 'Content-Type': 'application/json'},
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = 'none', 4500);
+}
+const act = (path, body) => api(path, body || {}).catch(e => toast(e.message));
+
+const S = {};      // id -> step meta+state
+const logs = {};   // id -> count
+const cards = {};  // id -> {root, pre, ...}
+const MAXLINES = 2000;
+
+function fmtTime(ts) { return new Date(ts * 1000).toTimeString().slice(0, 8); }
+
+function addLine(pre, ev, withTag) {
+  const near = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+  const line = el('div', ev.stream && ev.stream !== 'out' ? ev.stream : '');
+  if (withTag) { line.append(el('span', 'tag', ev.step + ' ')); }
+  line.append(document.createTextNode(fmtTime(ev.ts) + ' ' + ev.text));
+  pre.append(line);
+  while (pre.childElementCount > MAXLINES) pre.firstChild.remove();
+  if (near) pre.scrollTop = pre.scrollHeight;
+}
+
+function buildCard(s, idx) {
+  const c = el('section', 'card'); c.id = 'c-' + s.id;
+  const h = el('header');
+  const t = el('h3', '', (idx + 1) + '. ' + s.title);
+  t.append(el('span', 'badge', s.runner === 'cs' ? 'codespace' : 'termux'));
+  if (s.hitl) t.append(el('span', 'badge', 'human'));
+  const pill = el('span', 'pill', 'pending');
+  h.append(t, pill);
+  const desc = el('div', 'desc', s.desc);
+  const note = el('div', 'desc');
+  const hitl = el('div', 'hitl hide');
+  const hl = el('div'); const link = el('a'); link.target = '_blank'; link.rel = 'noopener';
+  const row = el('div', 'row'); const inp = el('input'); inp.placeholder = 'paste code / answer'; inp.autocomplete = 'off'; inp.autocapitalize = 'off';
+  const send = el('button', 'primary', 'Send');
+  const copy = el('button', '', 'Copy link');
+  row.append(inp, send);
+  hitl.append(hl, link, el('div'), copy, row);
+  const btns = el('div', 'btns');
+  const run = el('button', 'primary', 'Run');
+  const stop = el('button', '', 'Stop');
+  const reat = el('button', '', 'Reattach');
+  const tog = el('button', '', 'Log');
+  btns.append(run, stop, reat, tog);
+  const pre = el('pre', 'log hide');
+  c.append(h, desc, note, hitl, btns, pre);
+
+  run.onclick = () => {
+    const st = S[s.id];
+    let force = false;
+    if (s.danger && !confirm('This destroys the VM and network. Continue?')) return;
+    if (st.status === 'ok') { if (!confirm('Already done. Run again?')) return; force = true; }
+    pre.classList.remove('hide');
+    act(`/api/steps/${s.id}/run`, {force});
+  };
+  stop.onclick = () => act(`/api/steps/${s.id}/stop`);
+  reat.onclick = () => act(`/api/steps/${s.id}/reattach`);
+  tog.onclick = () => pre.classList.toggle('hide');
+  const doSend = () => { const v = inp.value; if (!v) return; inp.value = ''; act(`/api/steps/${s.id}/input`, {text: v}); };
+  send.onclick = doSend;
+  inp.onkeydown = e => { if (e.key === 'Enter') doSend(); };
+  copy.onclick = () => { const u = S[s.id].hitl && S[s.id].hitl.url; if (u && navigator.clipboard) navigator.clipboard.writeText(u).then(() => toast('Link copied')); };
+  cards[s.id] = {root: c, pill, note, hitl, hl, link, run, stop, reat, pre, inp, copy};
+  return c;
+}
+
+function refreshAll() {
+  for (const id in S) {
+    const s = S[id], c = cards[id]; if (!c) continue;
+    const unmet = (s.deps || []).filter(d => !['ok', 'up'].includes((S[d] || {}).status));
+    const blocked = s.status === 'pending' && unmet.length > 0;
+    c.pill.textContent = blocked ? 'blocked' : s.status.replace('_', ' ');
+    c.pill.className = 'pill ' + (blocked ? '' : s.status);
+    c.root.className = 'card ' + s.status;
+    c.note.textContent = blocked ? 'waiting on: ' + unmet.join(', ') : (s.note || '');
+    c.run.disabled = blocked || ['running', 'awaiting_human', 'up', 'detached'].includes(s.status);
+    c.run.textContent = s.status === 'ok' ? 'Re-run' : (s.status === 'failed' ? 'Retry' : 'Run');
+    if (s.danger) c.run.classList.add('danger');
+    c.stop.classList.toggle('hide', !(s.can_stop && ['running', 'up', 'detached', 'awaiting_human'].includes(s.status) || (s.can_stop && s.status === 'ok' && s.id === 'tunnel')));
+    c.reat.classList.toggle('hide', s.status !== 'detached');
+    const h = s.hitl;
+    if (s.status === 'awaiting_human' && h) {
+      c.hitl.classList.remove('hide');
+      c.hl.textContent = h.label + (h.url ? ' — open this link, sign in, then paste the code:' : ' — answer the prompt:');
+      if (h.url && h.url.startsWith('https://')) { c.link.href = h.url; c.link.textContent = h.url; c.link.classList.remove('hide'); c.copy.classList.remove('hide'); }
+      else { c.link.classList.add('hide'); c.copy.classList.add('hide'); }
+      c.pre.classList.remove('hide');
+    } else c.hitl.classList.add('hide');
+    if (['running', 'failed'].includes(s.status)) c.pre.classList.remove('hide');
+  }
+}
+
+function setConfig(cfg) {
+  for (const k of ['project_id', 'zone', 'repo_name', 'instance', 'cs_machine']) {
+    const i = $('#f_' + k); if (document.activeElement !== i) i.value = cfg[k] || '';
+  }
+  $('#r_owner').textContent = cfg.owner || '-';
+  $('#r_cs').textContent = cfg.cs_name || '-';
+}
+
+function onEvent(ev) {
+  if (ev.type === 'log') {
+    const c = cards[ev.step]; if (c) addLine(c.pre, ev, false);
+    addLine($('#timeline'), ev, true);
+  } else if (ev.type === 'state') {
+    if (S[ev.step]) { Object.assign(S[ev.step], ev.state); refreshAll(); }
+  } else if (ev.type === 'config') setConfig(ev.config);
+}
+
+function connect() {
+  const es = new EventSource('/api/events?since=0&t=' + encodeURIComponent(T));
+  es.onopen = () => $('#conn').classList.add('on');
+  es.onmessage = m => onEvent(JSON.parse(m.data));
+  es.onerror = () => $('#conn').classList.remove('on');
+}
+
+async function init() {
+  let snap;
+  try { snap = await api('/api/state'); }
+  catch (e) { document.body.prepend(el('p', '', 'Unauthorized: open the URL printed by controller.py (it contains ?t=...).')); return; }
+  const box = $('#steps');
+  snap.steps.forEach((s, i) => { S[s.id] = s; box.append(buildCard(s, i)); });
+  setConfig(snap.config);
+  if (!snap.config.project_id) $('#cfg').open = true;
+  refreshAll();
+  connect();
+}
+
+$('#saveCfg').onclick = () => {
+  const b = {}; for (const k of ['project_id', 'zone', 'repo_name', 'instance', 'cs_machine']) b[k] = $('#f_' + k).value.trim();
+  api('/api/config', b).then(() => toast('Saved')).catch(e => toast(e.message));
+};
+$('#refresh').onclick = () => { act('/api/refresh'); toast('Checking live state…'); };
+$('#tabSteps').onclick = () => { $('#steps').classList.remove('hide'); $('#timelineWrap').classList.add('hide'); $('#tabSteps').classList.add('active'); $('#tabTime').classList.remove('active'); };
+$('#tabTime').onclick = () => { $('#steps').classList.add('hide'); $('#timelineWrap').classList.remove('hide'); $('#tabTime').classList.add('active'); $('#tabSteps').classList.remove('active'); };
+init();
+</script>
+</body>
+</html>
