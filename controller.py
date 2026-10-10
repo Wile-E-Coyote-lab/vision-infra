@@ -128,15 +128,17 @@ cd "$REPO_DIR"
 ./termux/init-repo.sh "$REPO_NAME"
 '''),
     dict(id="codespace", title="Create / Repair Codespace", runner="local", deps=["repo", "token_scopes"], needs=["owner"], once=False,
-         desc="Prefer healthy Available codespace → full rebuild on unhealthy → delete+create on rebuild failure. Emits state=/ssh_elapsed=/toolchain=.",
+         desc="Prefer healthy Available codespace → pull latest → full rebuild → verify toolchain → delete+create on failure. Emits state=/ssh_elapsed=/toolchain=.",
          check=r'''n="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available"))|.[0].name//empty' 2>/dev/null)"; [ -n "$n" ] && echo "::set cs_name=$n"''',
          script=r'''
-# Selective determinism: healthy → rebuild → delete+create
-NAME="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available"))|.[0].name//empty' 2>/dev/null || true)"
-STATE="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available"))|.[0].state//"none"' 2>/dev/null || echo none)"
+NAME="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available" or .state=="Shutdown" or .state=="Rebuilding"))|.[0].name//empty' 2>/dev/null || true)"
+STATE="$(gh codespace list -R "$GH_REPO" --json name,state -q ".[]|select(.name==\"$NAME\")|.state//\"none\"" 2>/dev/null || echo none)"
 echo "state=$STATE"
 
 if [ -n "$NAME" ]; then
+  echo "pulling latest on $NAME …"
+  timeout 60 gh codespace ssh -c "$NAME" -- 'cd /workspaces/vision-infra && git fetch origin && git reset --hard origin/main' 2>/dev/null || true
+
   START=$(date +%s)
   if timeout 25 gh codespace ssh -c "$NAME" -- 'command -v gcloud && command -v terraform && command -v docker' >/dev/null 2>&1; then
     echo "reusing healthy codespace $NAME"
@@ -145,9 +147,22 @@ if [ -n "$NAME" ]; then
   else
     echo "existing codespace $NAME is unhealthy → full rebuild"
     if gh codespace rebuild -c "$NAME" --full; then
-      echo "rebuild_ok"
+      echo "rebuild_ok – waiting for Available …"
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        S="$(gh codespace list -R "$GH_REPO" --json name,state -q ".[]|select(.name==\"$NAME\")|.state" 2>/dev/null || true)"
+        echo "post-rebuild state=$S ($i/10)"
+        [ "$S" = "Available" ] && break
+        sleep 20
+      done
+      if timeout 30 gh codespace ssh -c "$NAME" -- 'command -v gcloud && command -v terraform && command -v docker' >/dev/null 2>&1; then
+        echo "toolchain=ok after rebuild"
+      else
+        echo "toolchain still missing after rebuild → delete + create"
+        gh codespace delete -c "$NAME" --force || true
+        NAME=""
+      fi
     else
-      echo "rebuild failed → delete + recreate"
+      echo "rebuild failed → delete + create"
       gh codespace delete -c "$NAME" --force || true
       NAME=""
     fi
@@ -155,12 +170,11 @@ if [ -n "$NAME" ]; then
 fi
 
 if [ -z "$NAME" ]; then
-  echo "creating codespace (machine: $CS_MACHINE) ..."
+  echo "creating codespace (machine: $CS_MACHINE) …"
   NAME="$(gh codespace create -R "$GH_REPO" -b main -m "$CS_MACHINE" --default-permissions --idle-timeout 60m)"
 fi
 echo "::set cs_name=$NAME"
-# short log tail for RTS
-gh codespace logs -c "$NAME" 2>/dev/null | tail -20 | sed 's/^/log_tail: /' || true
+gh codespace logs -c "$NAME" 2>/dev/null | tail -15 | sed 's/^/log_tail: /' || true
 '''),
     dict(id="cs_ready", title="Wait for toolchain", runner="local", deps=["codespace"], needs=["cs_name"],
          desc="Classified wait loop. Emits state=/ssh_elapsed=/toolchain=/log_tail: for live RTS.",
