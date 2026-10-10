@@ -127,27 +127,68 @@ exit 1
 cd "$REPO_DIR"
 ./termux/init-repo.sh "$REPO_NAME"
 '''),
-    dict(id="codespace", title="Create Codespace", runner="local", deps=["repo", "token_scopes"], needs=["owner"], once=True,
-         desc="Create (or reuse) the Codespace that acts as the control plane.",
-         check=r'''n="$(gh codespace list -R "$GH_REPO" --json name -q '.[0].name' 2>/dev/null)"; [ -n "$n" ] && echo "::set cs_name=$n"''',
+    dict(id="codespace", title="Create / Repair Codespace", runner="local", deps=["repo", "token_scopes"], needs=["owner"], once=False,
+         desc="Prefer healthy Available codespace → full rebuild on unhealthy → delete+create on rebuild failure. Emits state=/ssh_elapsed=/toolchain=.",
+         check=r'''n="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available"))|.[0].name//empty' 2>/dev/null)"; [ -n "$n" ] && echo "::set cs_name=$n"''',
          script=r'''
-name="$(gh codespace list -R "$GH_REPO" --json name -q '.[0].name' 2>/dev/null || true)"
-if [ -n "$name" ]; then
-  echo "reusing codespace $name"
-else
-  echo "creating codespace (machine: $CS_MACHINE) ..."
-  name="$(gh codespace create -R "$GH_REPO" -b main -m "$CS_MACHINE" --default-permissions --idle-timeout 60m)"
+# Selective determinism: healthy → rebuild → delete+create
+NAME="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available"))|.[0].name//empty' 2>/dev/null || true)"
+STATE="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available"))|.[0].state//"none"' 2>/dev/null || echo none)"
+echo "state=$STATE"
+
+if [ -n "$NAME" ]; then
+  START=$(date +%s)
+  if timeout 25 gh codespace ssh -c "$NAME" -- 'command -v gcloud && command -v terraform && command -v docker' >/dev/null 2>&1; then
+    echo "reusing healthy codespace $NAME"
+    echo "ssh_elapsed=$(( $(date +%s) - START ))s exit=0"
+    echo "toolchain=ok"
+  else
+    echo "existing codespace $NAME is unhealthy → full rebuild"
+    if gh codespace rebuild -c "$NAME" --full; then
+      echo "rebuild_ok"
+    else
+      echo "rebuild failed → delete + recreate"
+      gh codespace delete -c "$NAME" --force || true
+      NAME=""
+    fi
+  fi
 fi
-echo "::set cs_name=$name"
+
+if [ -z "$NAME" ]; then
+  echo "creating codespace (machine: $CS_MACHINE) ..."
+  NAME="$(gh codespace create -R "$GH_REPO" -b main -m "$CS_MACHINE" --default-permissions --idle-timeout 60m)"
+fi
+echo "::set cs_name=$NAME"
+# short log tail for RTS
+gh codespace logs -c "$NAME" 2>/dev/null | tail -20 | sed 's/^/log_tail: /' || true
 '''),
     dict(id="cs_ready", title="Wait for toolchain", runner="local", deps=["codespace"], needs=["cs_name"],
-         desc="Wait until the devcontainer build finished (gcloud, terraform, docker present).",
+         desc="Classified wait loop. Emits state=/ssh_elapsed=/toolchain=/log_tail: for live RTS.",
          script=r'''
 for i in $(seq 1 40); do
-  if gh codespace ssh -c "$CS_NAME" -- 'command -v gcloud && command -v terraform && command -v docker'; then
-    echo "toolchain ready"; exit 0
-  fi
-  echo "waiting for codespace build ($i/40)"; sleep 15
+  STATE="$(gh codespace list -R "$GH_REPO" --json name,state -q ".[]|select(.name==\"$CS_NAME\")|.state//\"none\"" 2>/dev/null || echo none)"
+  echo "state=$STATE attempt=$i/40"
+  case "$STATE" in
+    Available)
+      START=$(date +%s)
+      if timeout 25 gh codespace ssh -c "$CS_NAME" -- 'command -v gcloud && command -v terraform && command -v docker' >/dev/null 2>&1; then
+        echo "ssh_elapsed=$(( $(date +%s) - START ))s exit=0"
+        echo "toolchain=ok"
+        echo "toolchain ready"; exit 0
+      fi
+      echo "ssh_elapsed=$(( $(date +%s) - START ))s exit=1"
+      echo "toolchain=missing"
+      ;;
+    Failed|Shutdown)
+      echo "terminal state $STATE – re-run codespace step"
+      gh codespace logs -c "$CS_NAME" 2>/dev/null | tail -20 | sed 's/^/log_tail: /' || true
+      exit 1
+      ;;
+    *)
+      echo "waiting (state=$STATE)"
+      ;;
+  esac
+  sleep 15
 done
 echo "toolchain not ready; check .devcontainer feature IDs"; exit 1
 '''),
@@ -161,7 +202,7 @@ gh codespace ssh -c "$CS_NAME" -t -- "gcloud auth login --no-launch-browser && g
     dict(id="gcp_adc", title="Terraform credentials (human)", runner="local", deps=["cs_ready"],
          needs=["cs_name", "project_id"], interaction=INTER,
          desc="Application Default Credentials, used by Terraform. Same link-and-code flow.",
-         check=r'''test -s ~/.config/gcloud/application_default_credentials.json''',
+         check=r'''test -s \~/.config/gcloud/application_default_credentials.json''',
          script=r'''
 gh codespace ssh -c "$CS_NAME" -t -- "gcloud auth application-default login --no-launch-browser && (gcloud auth application-default set-quota-project $PROJECT_ID || true)"
 '''),
@@ -178,11 +219,11 @@ GH_REPO="$GH_REPO" ./bootstrap/bootstrap.sh
     dict(id="impersonate", title="Impersonate CI account", runner="cs", deps=["bootstrap", "gcp_adc"],
          needs=["cs_name", "project_id"],
          desc="Run Terraform as the least-privilege tf-ci service account (no key files).",
-         check=r'''test -s ~/.vision-infra.env''',
+         check=r'''test -s \~/.vision-infra.env''',
          script=r'''
 CI_SA="tf-ci@$PROJECT_ID.iam.gserviceaccount.com"
 OP="$(gcloud config get-value account 2>/dev/null)"
-cat > ~/.vision-infra.env <<EOF
+cat > \~/.vision-infra.env <<EOF
 export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=$CI_SA
 export TF_VAR_project_id=$PROJECT_ID
 export TF_VAR_region=$REGION
@@ -235,8 +276,8 @@ echo "VM not ready"; exit 1
          script=r'''
 cd "$REPO_PATH"
 git pull -q --ff-only || true
-gcloud compute scp deploy/redroid.sh "$INSTANCE":~/redroid.sh --zone "$ZONE" --project "$PROJECT_ID" --tunnel-through-iap --quiet
-gcloud compute ssh "$INSTANCE" --zone "$ZONE" --project "$PROJECT_ID" --tunnel-through-iap --quiet --command 'sudo bash ~/redroid.sh'
+gcloud compute scp deploy/redroid.sh "$INSTANCE":\~/redroid.sh --zone "$ZONE" --project "$PROJECT_ID" --tunnel-through-iap --quiet
+gcloud compute ssh "$INSTANCE" --zone "$ZONE" --project "$PROJECT_ID" --tunnel-through-iap --quiet --command 'sudo bash \~/redroid.sh'
 '''),
     dict(id="tunnel", title="IAP tunnel (Codespace)", runner="cs", deps=["vm_ready"],
          needs=["cs_name", "project_id"],
@@ -278,7 +319,7 @@ terraform destroy -input=false -no-color -auto-approve
 STEP_BY_ID = {s["id"]: s for s in STEPS}
 
 # --------------------------------------------------------------------------- redaction
-ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-\~]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
 SECRET_RES = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
     r"ya29\.[A-Za-z0-9_\-\.]+", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",

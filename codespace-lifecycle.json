@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "codespace": {
+    "id": "codespace",
+    "title": "Create / Repair Codespace",
+    "once": false,
+    "deps": ["repo", "token_scopes"],
+    "needs": ["owner"],
+    "desc": "Prefer healthy Available → full rebuild → delete+create. Emits state=/ssh_elapsed=/toolchain= for live RTS."
+  }
+}
