@@ -166,6 +166,7 @@ function refreshAll() {
   for (const id in S) {
     const s = S[id], c = cards[id]; if (!c) continue;
     const unmet = (s.deps || []).filter(d => !['ok', 'up'].includes((S[d] || {}).status));
+    if ((s.any_of || []).length && !s.any_of.some(d => ['ok', 'up'].includes((S[d] || {}).status))) unmet.push('one of: ' + s.any_of.join(' / '));
     const blocked = s.status === 'pending' && unmet.length > 0;
     c.pill.textContent = blocked ? 'blocked' : s.status.replace('_', ' ');
     c.pill.className = 'pill ' + (blocked ? '' : s.status);
@@ -220,7 +221,8 @@ async function init() {
   const box = $('#steps');
   snap.steps.forEach((s, i) => { S[s.id] = s; box.append(buildCard(s, i)); });
   setConfig(snap.config);
-  if (!snap.config.project_id) $('#cfg').open = true;
+  if (snap.profile === 'gcp' && !snap.config.project_id) $('#cfg').open = true;
+  $('h1').textContent += ' · ' + (snap.profile === 'gcp' ? 'GCE plane' : 'Codespace plane');
   refreshAll();
   connect();
 }

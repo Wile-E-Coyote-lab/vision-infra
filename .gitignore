@@ -1,8 +1,5 @@
-vars.env
-.terraform/
-*.tfstate*
-tfplan
 logs/
 state.json
 state.tmp
+ledger.jsonl
 __pycache__/

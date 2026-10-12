@@ -2,7 +2,7 @@
 """vision-infra controller: localhost dashboard that runs each provisioning step
 as an isolated job with its own log stream, state and (optional) human-in-the-loop prompt.
 
-  Termux (this process) --gh--> GitHub / Codespace --gcloud+terraform--> GCE (Redroid)
+  Termux (this process) --gh--> GitHub / Codespace (Docker) --> Android engine (Redroid or KVM emulator)
 
 Stdlib only. Binds to 127.0.0.1. Every request needs the per-run token.
 Run:  python3 controller.py        (then open the printed URL)
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import hmac
 import json
 import os
@@ -32,8 +33,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
-LOG_DIR = ROOT / "logs"
-STATE_FILE = ROOT / "state.json"
+DATA_DIR = Path(os.environ.get("VI_HOME") or ROOT)  # tests point this at a temp dir
+LOG_DIR = DATA_DIR / "logs"
+STATE_FILE = DATA_DIR / "state.json"
+LEDGER_FILE = DATA_DIR / "ledger.jsonl"
 HITL_TIMEOUT = 900  # seconds a step may wait for a human
 
 # --------------------------------------------------------------------------- config
@@ -52,12 +55,6 @@ VALID = {
 SET_KEYS = {"owner", "cs_name"}  # keys a step may set via '::set key=value'
 
 # --------------------------------------------------------------------------- steps
-INTER = {
-    "label": "Google sign-in code",
-    "url_re": r"https://accounts\.google\.com/\S+",
-    "prompt_re": r"(?i)(authorization code|verification code|\(Y/n\)|\[Y/n\])",
-}
-
 INTER_CONFIRM = {
     "label": "GitHub token scopes",
     "url_re": r"https://github\.com/settings/tokens\S*",
@@ -65,8 +62,31 @@ INTER_CONFIRM = {
     "confirm": True,  # dashboard shows a single 'Done, re-check' button instead of a text box
 }
 
+# Shared bash helper: try every legitimate way to get binder inside this Codespace.
+BINDER_SETUP = r'''
+setup_binder() {
+  if grep -qw binder /proc/filesystems; then echo "binderfs: present"; return 0; fi
+  sudo modprobe binder_linux devices=binder,hwbinder,vndbinder >/dev/null 2>&1 || true
+  if grep -qw binder /proc/filesystems; then echo "binder_linux: loaded"; return 0; fi
+  KREL="$(uname -r)"
+  echo "binder not loaded; looking for linux-modules-extra-$KREL"
+  sudo apt-get update -qq >/dev/null 2>&1 || true
+  if apt-cache policy "linux-modules-extra-$KREL" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+    if sudo apt-get install -y -qq "linux-modules-extra-$KREL" >/dev/null 2>&1; then
+      echo "installed linux-modules-extra-$KREL"
+    else
+      echo "install of linux-modules-extra-$KREL failed"
+    fi
+    sudo modprobe binder_linux devices=binder,hwbinder,vndbinder 2>&1 | tail -2 || true
+  else
+    echo "apt has no linux-modules-extra-$KREL (exact package for the running kernel is missing)"
+  fi
+  grep -qw binder /proc/filesystems
+}
+'''
+
 STEPS = [
-    dict(id="preflight", title="Preflight", runner="local", deps=[], needs=[],
+    dict(id="preflight", effect="read", provides=["owner"], title="Preflight", runner="local", deps=[], needs=[],
          desc="Check Termux tools and that the GitHub token works.",
          script=r'''
 for c in git gh curl jq; do
@@ -77,7 +97,7 @@ login="$(gh api user -q .login)"
 echo "GitHub token valid for: $login"
 echo "::set owner=$login"
 '''),
-    dict(id="token_scopes", title="Token scopes", runner="local", deps=["preflight"], needs=[],
+    dict(id="token_scopes", effect="read", provides=[], title="Token scopes", runner="local", deps=["preflight"], needs=[],
          interaction=INTER_CONFIRM,
          desc="Boolean token handling: classic token -> verify scopes, edit in place if short; other types -> warn and continue.",
          check=r'''case "$GH_TOKEN" in ghp_*) ;; *) exit 0;; esac
@@ -120,220 +140,214 @@ done
 echo "still missing:$missing"
 exit 1
 '''),
-    dict(id="repo", title="Create + push repo", runner="local", deps=["token_scopes"], needs=["owner"], once=True,
+    dict(id="repo", effect="write", provides=[], title="Create + push repo", runner="local", deps=["token_scopes"], needs=["owner"], once=True,
          desc="Create the private GitHub repo via REST and push this tree (one time).",
          check=r'''gh repo view "$GH_REPO" >/dev/null 2>&1''',
          script=r'''
 cd "$REPO_DIR"
 ./termux/init-repo.sh "$REPO_NAME"
 '''),
-    dict(id="codespace", title="Create / Repair Codespace", runner="local", deps=["repo", "token_scopes"], needs=["owner"], once=False,
-         desc="Prefer healthy Available codespace → pull latest → full rebuild → verify toolchain → delete+create on failure. Emits state=/ssh_elapsed=/toolchain=.",
+    dict(id="codespace", effect="write", provides=["cs_name"], title="Create / Repair Codespace", runner="local", deps=["repo", "token_scopes"], needs=["owner"], once=False,
+         desc="Deterministic: prefer newest Available codespace, otherwise create.",
          check=r'''n="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available"))|.[0].name//empty' 2>/dev/null)"; [ -n "$n" ] && echo "::set cs_name=$n"''',
          script=r'''
-NAME="$(gh codespace list -R "$GH_REPO" --json name,state -q 'map(select(.state=="Available" or .state=="Shutdown" or .state=="Rebuilding"))|.[0].name//empty' 2>/dev/null || true)"
-STATE="$(gh codespace list -R "$GH_REPO" --json name,state -q ".[]|select(.name==\"$NAME\")|.state//\"none\"" 2>/dev/null || echo none)"
-echo "state=$STATE"
+REPO="$GH_REPO"
+echo "=== codespace inventory ==="
+gh codespace list -R "$REPO" --json name,state,createdAt | jq -c '.[]'
 
-if [ -n "$NAME" ]; then
-  echo "pulling latest on $NAME …"
-  timeout 60 gh codespace ssh -c "$NAME" -- 'cd /workspaces/vision-infra && git fetch origin && git reset --hard origin/main' 2>/dev/null || true
+# 1. Delete everything that is Shutdown or Failed (free quota)
+for n in $(gh codespace list -R "$REPO" --json name,state -q \
+  'map(select(.state=="Shutdown" or .state=="Failed")) | .[].name'); do
+  echo "deleting stale $n"
+  gh codespace delete -c "$n" --force || true
+done
 
-  START=$(date +%s)
-  if timeout 25 gh codespace ssh -c "$NAME" -- 'command -v gcloud && command -v terraform && command -v docker' >/dev/null 2>&1; then
-    echo "reusing healthy codespace $NAME"
-    echo "ssh_elapsed=$(( $(date +%s) - START ))s exit=0"
-    echo "toolchain=ok"
-  else
-    echo "existing codespace $NAME is unhealthy → full rebuild"
-    if gh codespace rebuild -c "$NAME" --full; then
-      echo "rebuild_ok – waiting for Available …"
-      for i in 1 2 3 4 5 6 7 8 9 10; do
-        S="$(gh codespace list -R "$GH_REPO" --json name,state -q ".[]|select(.name==\"$NAME\")|.state" 2>/dev/null || true)"
-        echo "post-rebuild state=$S ($i/10)"
-        [ "$S" = "Available" ] && break
-        sleep 20
-      done
-      if timeout 30 gh codespace ssh -c "$NAME" -- 'command -v gcloud && command -v terraform && command -v docker' >/dev/null 2>&1; then
-        echo "toolchain=ok after rebuild"
-      else
-        echo "toolchain still missing after rebuild → delete + create"
-        gh codespace delete -c "$NAME" --force || true
-        NAME=""
-      fi
-    else
-      echo "rebuild failed → delete + create"
-      gh codespace delete -c "$NAME" --force || true
-      NAME=""
-    fi
-  fi
-fi
+# 2. Prefer newest Available, else newest Provisioning
+NAME="$(gh codespace list -R "$REPO" --json name,state,createdAt \
+  -q 'map(select(.state=="Available")) | sort_by(.createdAt) | reverse | .[0].name // empty')"
 
 if [ -z "$NAME" ]; then
-  echo "creating codespace (machine: $CS_MACHINE) …"
-  NAME="$(gh codespace create -R "$GH_REPO" -b main -m "$CS_MACHINE" --default-permissions --idle-timeout 60m)"
+  NAME="$(gh codespace list -R "$REPO" --json name,state,createdAt \
+    -q 'map(select(.state=="Provisioning" or .state=="Starting")) | sort_by(.createdAt) | reverse | .[0].name // empty')"
 fi
+
+if [ -n "$NAME" ]; then
+  echo "reusing existing: $NAME"
+else
+  # only create when there is truly none
+  LIVE=$(gh codespace list -R "$REPO" --json name,state -q \
+    'map(select(.state=="Available" or .state=="Provisioning" or .state=="Starting")) | length')
+  if [ "$LIVE" -gt 0 ]; then
+    echo "live codespaces still starting – wait and re-run this step"
+    exit 1
+  fi
+  echo "no usable codespace → creating …"
+  NAME="$(gh codespace create -R "$REPO" -b main -m "$CS_MACHINE" \
+    --default-permissions --idle-timeout 60m)"
+  echo "created $NAME"
+fi
+
 echo "::set cs_name=$NAME"
-gh codespace logs -c "$NAME" 2>/dev/null | tail -15 | sed 's/^/log_tail: /' || true
+echo "registered_cs_name=$NAME"
+
+# confirmation
+echo "=== registration check ==="
+gh api "user/codespaces" -q ".codespaces[] | select(.name==\"$NAME\") | {name,state,machine}" || true
 '''),
-    dict(id="cs_ready", title="Wait for toolchain", runner="local", deps=["codespace"], needs=["cs_name"],
-         desc="Classified wait loop. Emits state=/ssh_elapsed=/toolchain=/log_tail: for live RTS.",
+    dict(id="cs_ready", effect="read", provides=[], title="Wait for toolchain", runner="local", deps=["codespace"], needs=["cs_name"],
+         desc="Classified wait loop with toolchain verification.",
          script=r'''
+TOOLCHECK="$(printf 'command -v %s >/dev/null && ' $REQ_TOOLS)true"
+echo "waiting for toolchain ($REQ_TOOLS) on $CS_NAME"
 for i in $(seq 1 40); do
-  STATE="$(gh codespace list -R "$GH_REPO" --json name,state -q ".[]|select(.name==\"$CS_NAME\")|.state//\"none\"" 2>/dev/null || echo none)"
+  STATE="$(gh codespace list -R "$GH_REPO" --json name,state \
+    | jq -r --arg n "$CS_NAME" '.[] | select(.name==$n) | .state // "none"')"
   echo "state=$STATE attempt=$i/40"
+
   case "$STATE" in
     Available)
       START=$(date +%s)
-      if timeout 25 gh codespace ssh -c "$CS_NAME" -- 'command -v gcloud && command -v terraform && command -v docker' >/dev/null 2>&1; then
+      if timeout 25 gh codespace ssh -c "$CS_NAME" -- \
+           "$TOOLCHECK" >/dev/null 2>&1; then
         echo "ssh_elapsed=$(( $(date +%s) - START ))s exit=0"
         echo "toolchain=ok"
-        echo "toolchain ready"; exit 0
+        gh codespace ssh -c "$CS_NAME" -- \
+          'echo "docker: $(docker version --format {{.Server.Version}} 2>/dev/null)"' \
+          | sed 's/^/tool: /'
+        exit 0
       fi
-      echo "ssh_elapsed=$(( $(date +%s) - START ))s exit=1"
-      echo "toolchain=missing"
+      echo "ssh_elapsed=$(( $(date +%s) - START ))s exit=1 toolchain=missing"
       ;;
     Failed|Shutdown)
       echo "terminal state $STATE – re-run codespace step"
-      gh codespace logs -c "$CS_NAME" 2>/dev/null | tail -20 | sed 's/^/log_tail: /' || true
       exit 1
       ;;
-    *)
-      echo "waiting (state=$STATE)"
-      ;;
+    *) echo "waiting (state=$STATE)" ;;
   esac
   sleep 15
 done
-echo "toolchain not ready; check .devcontainer feature IDs"; exit 1
+echo "toolchain not ready"; exit 1
 '''),
-    dict(id="gcp_login", title="Google login (human)", runner="local", deps=["cs_ready"],
-         needs=["cs_name", "project_id"], interaction=INTER,
-         desc="gcloud auth login inside the Codespace. Open the link, paste the code here.",
-         check=r'''gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .''',
-         script=r'''
-gh codespace ssh -c "$CS_NAME" -t -- "gcloud auth login --no-launch-browser && gcloud config set project $PROJECT_ID"
+    dict(id="host_probe", effect="write", provides=[], title="Probe kernel (binder / KVM)", runner="cs", deps=["cs_ready"], needs=["cs_name"],
+         desc="Tries to enable binder (installs the kernel's extra modules if apt has them) and reports KVM. Decides which engine can run.",
+         script=BINDER_SETUP + r'''
+echo "kernel: $(uname -r)"
+echo "cpus: $(nproc)  mem_mb: $(free -m | awk '/^Mem:/{print $2}')"
+echo "modules_disabled: $(cat /proc/sys/kernel/modules_disabled 2>/dev/null || echo n/a)"
+echo "lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo n/a)"
+CAP="$(sudo grep CapEff /proc/self/status | awk '{print $2}')"
+if [ $(( 0x${CAP:-0} & 65536 )) -ne 0 ]; then echo "CAP_SYS_MODULE: yes"; else echo "CAP_SYS_MODULE: no"; fi
+if [ -e /dev/kvm ]; then echo "kvm: present"; else echo "kvm: absent"; fi
+if sudo docker info >/dev/null 2>&1; then echo "docker: ok"; else echo "docker: daemon not reachable yet"; fi
+binder=0; kvm=0
+if setup_binder; then binder=1; fi
+if [ -e /dev/kvm ]; then kvm=1; fi
+if [ $binder = 1 ]; then echo "ENGINE: redroid possible (binder present)"; fi
+if [ $kvm = 1 ]; then echo "ENGINE: android emulator image possible (/dev/kvm present)"; fi
+if [ $binder = 0 ] && [ $kvm = 0 ]; then
+  echo "RESULT: neither binder nor KVM available in this Codespace"
+  exit 1
+fi
+echo "RESULT: at least one engine is possible"
 '''),
-    dict(id="gcp_adc", title="Terraform credentials (human)", runner="local", deps=["cs_ready"],
-         needs=["cs_name", "project_id"], interaction=INTER,
-         desc="Application Default Credentials, used by Terraform. Same link-and-code flow.",
-         check=r'''test -s \~/.config/gcloud/application_default_credentials.json''',
-         script=r'''
-gh codespace ssh -c "$CS_NAME" -t -- "gcloud auth application-default login --no-launch-browser && (gcloud auth application-default set-quota-project $PROJECT_ID || true)"
-'''),
-    dict(id="bootstrap", title="Bootstrap GCP", runner="cs", deps=["gcp_login"],
-         needs=["cs_name", "project_id"], once=True,
-         desc="Enable APIs, create state bucket, CI service account, WIF (one time).",
-         check=r'''gcloud iam service-accounts describe "tf-ci@$PROJECT_ID.iam.gserviceaccount.com" >/dev/null 2>&1''',
-         script=r'''
+    dict(id="redroid_up", effect="write", provides=[], title="Run Redroid in Codespace", runner="cs", deps=["host_probe"], needs=["cs_name"],
+         desc="Engine A (needs binder): docker run Redroid inside the Codespace and wait for Android to boot.",
+         check=r'''sudo docker ps --filter name=redroid --filter status=running --format '{{.Names}}' | grep -qx redroid''',
+         script=BINDER_SETUP + r'''
+if ! setup_binder; then echo "binder unavailable in this Codespace; run Probe kernel and see its ENGINE lines"; exit 1; fi
 cd "$REPO_PATH"
 git pull -q --ff-only || true
-gcloud config set project "$PROJECT_ID" >/dev/null
-GH_REPO="$GH_REPO" ./bootstrap/bootstrap.sh
-'''),
-    dict(id="impersonate", title="Impersonate CI account", runner="cs", deps=["bootstrap", "gcp_adc"],
-         needs=["cs_name", "project_id"],
-         desc="Run Terraform as the least-privilege tf-ci service account (no key files).",
-         check=r'''test -s \~/.vision-infra.env''',
-         script=r'''
-CI_SA="tf-ci@$PROJECT_ID.iam.gserviceaccount.com"
-OP="$(gcloud config get-value account 2>/dev/null)"
-cat > \~/.vision-infra.env <<EOF
-export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT=$CI_SA
-export TF_VAR_project_id=$PROJECT_ID
-export TF_VAR_region=$REGION
-export TF_VAR_zone=$ZONE
-export TF_VAR_instance_name=$INSTANCE
-export TF_VAR_operator_member=user:$OP
-export TF_STATE_BUCKET=$PROJECT_ID-tfstate
-EOF
-for i in 1 2 3 4 5 6; do
-  if gcloud auth print-access-token --impersonate-service-account="$CI_SA" >/dev/null 2>&1; then
-    echo "impersonation OK as $CI_SA"; exit 0
-  fi
-  echo "waiting for IAM propagation ($i/6)"; sleep 10
+for i in $(seq 1 20); do
+  sudo docker info >/dev/null 2>&1 && break
+  echo "waiting for docker daemon ($i/20)"; sleep 3
 done
-echo "impersonation failed"; exit 1
-'''),
-    dict(id="tf_plan", title="Terraform plan", runner="cs", deps=["impersonate"],
-         needs=["cs_name", "project_id"],
-         desc="terraform init + plan against the GCS backend.",
-         script=r'''
-git -C "$REPO_PATH" pull -q --ff-only || true
-cd "$REPO_PATH/terraform"
-terraform init -input=false -no-color -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="prefix=android-host"
-terraform plan -input=false -no-color -out=tfplan
-'''),
-    dict(id="tf_apply", title="Terraform apply", runner="cs", deps=["tf_plan"],
-         needs=["cs_name", "project_id"],
-         desc="Apply the saved plan: VPC, NAT, IAP firewall, VM.",
-         check=r'''gcloud compute instances describe "$INSTANCE" --zone "$ZONE" --project "$PROJECT_ID" --format='value(status)' | grep -q RUNNING''',
-         script=r'''
-cd "$REPO_PATH/terraform"
-terraform apply -input=false -no-color tfplan
-'''),
-    dict(id="vm_ready", title="Wait for VM host setup", runner="cs", deps=["tf_apply"],
-         needs=["cs_name", "project_id"],
-         desc="Wait for the startup script (Docker, binder modules, Redroid) over IAP SSH.",
-         script=r'''
-for i in $(seq 1 40); do
-  if gcloud compute ssh "$INSTANCE" --zone "$ZONE" --project "$PROJECT_ID" --tunnel-through-iap --quiet \
-       --command 'grep -q "setup complete" /var/log/android-setup.log && sudo docker ps --filter name=redroid --format "{{.Status}}"' 2>&1; then
-    echo "VM ready"; exit 0
-  fi
-  echo "waiting for VM ($i/40)"; sleep 15
+sudo docker info >/dev/null 2>&1 || { echo "docker daemon not running in this Codespace"; exit 1; }
+sudo docker rm -f emulator >/dev/null 2>&1 || true
+sudo bash deploy/redroid.sh
+echo "waiting for Android boot (up to 3 min)"
+for i in $(seq 1 36); do
+  b="$(sudo docker exec redroid getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+  if [ "$b" = "1" ]; then echo "android booted"; exit 0; fi
+  echo "booting ($i/36)"; sleep 5
 done
-echo "VM not ready"; exit 1
+echo "Redroid did not finish booting; last container log:"
+sudo docker logs --tail 30 redroid 2>&1 || true
+exit 1
 '''),
-    dict(id="deploy", title="Deploy Redroid", runner="cs", deps=["vm_ready"],
-         needs=["cs_name", "project_id"],
-         desc="Ship deploy/redroid.sh to the VM and (re)create the container.",
+    dict(id="emu_key", effect="auth", provides=[], title="adb key handoff (emulator)", runner="local", deps=["host_probe"], needs=["cs_name"],
+         desc="Engine B (needs /dev/kvm). Makes a dedicated adb key here and installs it in the Codespace so only this phone can talk to the emulator.",
          script=r'''
-cd "$REPO_PATH"
-git pull -q --ff-only || true
-gcloud compute scp deploy/redroid.sh "$INSTANCE":\~/redroid.sh --zone "$ZONE" --project "$PROJECT_ID" --tunnel-through-iap --quiet
-gcloud compute ssh "$INSTANCE" --zone "$ZONE" --project "$PROJECT_ID" --tunnel-through-iap --quiet --command 'sudo bash \~/redroid.sh'
+mkdir -p "$HOME/.android"
+if [ ! -s "$HOME/.android/vi_adbkey" ]; then
+  adb keygen "$HOME/.android/vi_adbkey"
+  echo "generated dedicated key ~/.android/vi_adbkey"
+fi
+gh codespace ssh -c "$CS_NAME" -- 'umask 077; mkdir -p ~/.android && cat > ~/.android/vi_adbkey' < "$HOME/.android/vi_adbkey"
+echo "key installed in Codespace (private key never printed)"
 '''),
-    dict(id="tunnel", title="IAP tunnel (Codespace)", runner="cs", deps=["vm_ready"],
-         needs=["cs_name", "project_id"],
-         desc="Background IAP tunnel Codespace:5555 -> VM:5555.",
-         stop=r'''pkill -f '[s]tart-iap-tunnel' || true''',
-         check=r'''pgrep -f '[s]tart-iap-tunnel' >/dev/null''',
+    dict(id="emu_up", effect="write", provides=[], title="Run Android emulator (KVM)", runner="cs", deps=["emu_key"], needs=["cs_name"],
+         desc="Engine B: Google's Android emulator container using /dev/kvm. No binder needed. First pull is large; boot can take minutes.",
+         check=r'''sudo docker ps --filter name=emulator --filter status=running --format '{{.Names}}' | grep -qx emulator''',
          script=r'''
-pkill -f '[s]tart-iap-tunnel' || true
-nohup gcloud compute start-iap-tunnel "$INSTANCE" 5555 --local-host-port=localhost:5555 \
-  --zone "$ZONE" --project "$PROJECT_ID" > /tmp/iap-tunnel.log 2>&1 < /dev/null &
-sleep 6
-cat /tmp/iap-tunnel.log
-pgrep -f '[s]tart-iap-tunnel' >/dev/null && echo "tunnel up"
+IMAGE="us-docker.pkg.dev/android-emulator-268719/images/30-google-x64:30.1.2"
+if [ ! -s "$HOME/.android/vi_adbkey" ]; then echo "adb key missing: run the adb key handoff step first"; exit 1; fi
+if ! sudo test -w /dev/kvm; then echo "/dev/kvm is not writable"; exit 1; fi
+for i in $(seq 1 20); do
+  sudo docker info >/dev/null 2>&1 && break
+  echo "waiting for docker daemon ($i/20)"; sleep 3
+done
+sudo docker info >/dev/null 2>&1 || { echo "docker daemon not running"; exit 1; }
+sudo docker rm -f redroid emulator >/dev/null 2>&1 || true
+echo "pulling $IMAGE (large; first time only)"
+sudo docker pull "$IMAGE"
+sudo docker run -d --name emulator --device /dev/kvm -e ADBKEY="$(cat "$HOME/.android/vi_adbkey")" \
+  -p 5554:5554 -p 5555:5555 --restart unless-stopped "$IMAGE" >/dev/null
+echo "emulator container started"
+sudo apt-get install -y -qq adb >/dev/null 2>&1 || sudo apt-get install -y -qq android-tools-adb >/dev/null 2>&1 || echo "could not install adb in Codespace"
+export ADB_VENDOR_KEYS="$HOME/.android/vi_adbkey"
+adb kill-server >/dev/null 2>&1 || true
+echo "waiting for Android boot (nested virtualization: can take several minutes)"
+for i in $(seq 1 90); do
+  adb connect localhost:5555 >/dev/null 2>&1 || true
+  b="$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+  if [ "$b" = "1" ]; then echo "android booted"; exit 0; fi
+  echo "booting ($i/90)"; sleep 5
+done
+echo "emulator did not finish booting; last container log:"
+sudo docker logs --tail 40 emulator 2>&1 || true
+exit 1
 '''),
-    dict(id="portfwd", title="Forward port to phone", runner="local", deps=["tunnel"],
+    dict(id="portfwd", effect="write", provides=[], title="Forward port to phone", runner="local", deps=["host_probe"], any_of=["redroid_up", "emu_up"],
          needs=["cs_name"], service=dict(ready_re=r"(?i)forwarding", ready_after=5),
          desc="Long-running: Codespace:5555 -> localhost:5555 on this phone. Stop to close.",
          script=r'''
 gh codespace ports forward 5555:5555 -c "$CS_NAME"
 '''),
-    dict(id="adb_connect", title="adb connect", runner="local", deps=["portfwd"], needs=[],
+    dict(id="adb_connect", effect="write", provides=[], title="adb connect", runner="local", deps=["portfwd"], needs=[],
          desc="adb connect localhost:5555 and list devices.",
          check=r'''adb devices | grep -q 'localhost:5555.*device$' ''',
          script=r'''
+if [ -s "$HOME/.android/vi_adbkey" ]; then export ADB_VENDOR_KEYS="$HOME/.android/vi_adbkey"; fi
+adb kill-server >/dev/null 2>&1 || true
 adb start-server >/dev/null 2>&1 || true
 adb connect localhost:5555
 sleep 2
 adb devices
 '''),
-    dict(id="destroy", title="Destroy VM + network", runner="cs", deps=["impersonate"],
-         needs=["cs_name", "project_id"], danger=True,
-         desc="terraform destroy. Leaves bootstrap resources (bucket, WIF, CI account).",
+    dict(id="cs_stop", effect="write", provides=[], title="Stop Codespace (save quota)", runner="local", deps=[], needs=["cs_name"],
+         desc="Free plan = 120 core-hours/month. Stop the Codespace when you are done.",
          script=r'''
-cd "$REPO_PATH/terraform"
-terraform init -input=false -no-color -backend-config="bucket=$TF_STATE_BUCKET" -backend-config="prefix=android-host"
-terraform destroy -input=false -no-color -auto-approve
+gh codespace stop -c "$CS_NAME"
+echo "stopped; it restarts automatically on the next gh codespace ssh"
 '''),
 ]
+for _s in STEPS:
+    _s.setdefault("any_of", [])
 STEP_BY_ID = {s["id"]: s for s in STEPS}
+REGISTRY_SHA = hashlib.sha256(json.dumps(STEPS, sort_keys=True).encode()).hexdigest()
 
 # --------------------------------------------------------------------------- redaction
-ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-\~]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
 SECRET_RES = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}",
     r"ya29\.[A-Za-z0-9_\-\.]+", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
@@ -389,13 +403,64 @@ BUS = Bus()
 LOG_LOCK = threading.Lock()
 
 
+RUNHASH: dict = {}  # sid -> sha256 over the redacted log lines of the current run
+LEDGER_LOCK = threading.Lock()
+_LEDGER_PREV = [None]
+
+
 def log(sid: str, text: str, stream: str = "out"):
     text = redact(text)
     ev = BUS.publish("log", step=sid, stream=stream, text=text)
     LOG_DIR.mkdir(exist_ok=True)
     with LOG_LOCK:
+        RUNHASH.setdefault(sid, hashlib.sha256()).update(f"{stream}:{text}\n".encode())
         with open(LOG_DIR / f"{sid}.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": ev["ts"], "step": sid, "stream": stream, "text": text}) + "\n")
+
+
+# --------------------------------------------------------------------------- evidence ledger
+def _ledger_prev() -> str:
+    if _LEDGER_PREV[0] is None:
+        last = "0" * 64
+        if LEDGER_FILE.exists():
+            for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines():
+                try:
+                    last = json.loads(line)["hash"]
+                except Exception:  # noqa: BLE001
+                    pass
+        _LEDGER_PREV[0] = last
+    return _LEDGER_PREV[0]
+
+
+def ledger_append(event: str, **fields):
+    """Append-only, hash-chained record. Structural fields only: never free text, never secrets."""
+    rec = {"ts": round(time.time(), 3), "event": event, **fields}
+    with LEDGER_LOCK:
+        rec["prev"] = _ledger_prev()
+        h = hashlib.sha256((rec["prev"] + json.dumps(rec, sort_keys=True)).encode()).hexdigest()
+        LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LEDGER_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({**rec, "hash": h}, sort_keys=True) + "\n")
+        _LEDGER_PREV[0] = h
+
+
+def verify_ledger() -> tuple:
+    """Returns (ok, records_verified, message)."""
+    prev, n = "0" * 64, 0
+    if not LEDGER_FILE.exists():
+        return True, 0, "empty"
+    for i, line in enumerate(LEDGER_FILE.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            rec = json.loads(line)
+        except Exception:  # noqa: BLE001
+            return False, n, f"line {i}: not JSON"
+        h = rec.pop("hash", None)
+        if rec.get("prev") != prev:
+            return False, n, f"line {i}: chain broken"
+        if hashlib.sha256((prev + json.dumps(rec, sort_keys=True)).encode()).hexdigest() != h:
+            return False, n, f"line {i}: hash mismatch"
+        prev, n = h, n + 1
+    return True, n, "ok"
 
 
 # --------------------------------------------------------------------------- state
@@ -452,19 +517,29 @@ def set_status(sid: str, status: str, **kw):
             st["ended"] = time.time()
         STORE.save()
         snap = public_step(sid)
+        ex = st.get("exit")
+    rh = RUNHASH.get(sid)
+    ledger_append("state", step=sid, status=status, exit=ex, registry_sha=REGISTRY_SHA,
+                  log_sha256=rh.hexdigest() if rh else None)
     BUS.publish("state", step=sid, state=snap)
 
 
-def apply_set(kv: str):
+def apply_set(kv: str, allowed=(), sid: str = "ctl") -> bool:
+    """Step output is untrusted. Accept '::set key=value' only if the step declared the key in
+    `provides` and the value matches a strict pattern."""
     if "=" not in kv:
-        return
-    k, v = kv.split("=", 1)
-    k, v = k.strip(), v.strip()
-    if k in SET_KEYS and re.fullmatch(r"[A-Za-z0-9._\-]{1,100}", v):
-        with STORE.lock:
-            STORE.data["config"][k] = v
-            STORE.save()
-        BUS.publish("config", config=STORE.cfg())
+        return False
+    k, v = (x.strip() for x in kv.split("=", 1))
+    if k not in SET_KEYS or k not in allowed or not re.fullmatch(r"[A-Za-z0-9._\-]{1,100}", v):
+        ledger_append("set_rejected", step=sid, key=k[:40])
+        log(sid, f"rejected ::set for key {k[:40]!r}", "err")
+        return False
+    with STORE.lock:
+        STORE.data["config"][k] = v
+        STORE.save()
+    ledger_append("config_set", step=sid, key=k, value_sha256=hashlib.sha256(v.encode()).hexdigest())
+    BUS.publish("config", config=STORE.cfg())
+    return True
 
 
 def cfg_env() -> dict:
@@ -482,7 +557,7 @@ def build_env() -> dict:
     e = dict(os.environ)
     e.update(cfg_env())
     e.update({"REPO_DIR": str(ROOT), "GH_TOKEN": GH_TOKEN, "GH_PAT": GH_TOKEN,
-              "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1", "TERM": "xterm"})
+              "GH_PROMPT_DISABLED": "1", "REQ_TOOLS": "docker", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1", "TERM": "xterm"})
     return e
 
 
@@ -511,8 +586,8 @@ def run_local(sid: str, s: dict):
         if not line.strip():
             return
         if line.startswith("::set "):
-            apply_set(line[6:])
-            log(sid, "set " + line[6:], "ctl")
+            if apply_set(line[6:], s.get("provides", ()), sid):
+                log(sid, "set " + line[6:], "ctl")
             return
         log(sid, line)
         mm = re.search(r'needs the "([\w:]+)" scope', line)
@@ -661,7 +736,7 @@ def run_cs(sid: str, s: dict, resume: bool = False):
         for line in ANSI.sub("", content.decode("utf-8", "replace")).splitlines():
             if line.strip():
                 if line.startswith("::set "):
-                    apply_set(line[6:])
+                    apply_set(line[6:], s.get("provides", ()), sid)
                 log(sid, line)
         with STORE.lock:
             st["remote_off"] = off + len(content)
@@ -689,7 +764,12 @@ def thread_main(sid: str, resume: bool = False):
 
 
 def deps_met(sid: str) -> list:
-    return [d for d in STEP_BY_ID[sid]["deps"] if STORE.step(d)["status"] not in ("ok", "up")]
+    s = STEP_BY_ID[sid]
+    unmet = [d for d in s["deps"] if STORE.step(d)["status"] not in ("ok", "up")]
+    any_of = s.get("any_of") or []
+    if any_of and not any(STORE.step(d)["status"] in ("ok", "up") for d in any_of):
+        unmet.append("one of: " + " / ".join(any_of))
+    return unmet
 
 
 def api_error(code: int, msg: str):
@@ -725,6 +805,7 @@ def start_step(sid: str, force: bool = False, resume: bool = False):
             api_error(400, "set/obtain first: " + ", ".join(missing))
         if not resume:
             st.update(started=time.time(), ended=None, exit=None, hitl=None, note="")
+            RUNHASH[sid] = hashlib.sha256()
             if s["runner"] == "cs":
                 st["launched"] = False
     set_status(sid, "running")
@@ -774,7 +855,7 @@ def run_check(s: dict) -> bool:
         r = cs_ssh("bash -s", stdin=cs_script(s["check"]).encode(), timeout=60)
     for line in r.stdout.decode(errors="replace").splitlines():
         if line.startswith("::set "):
-            apply_set(line[6:])
+            apply_set(line[6:], s.get("provides", ()), s["id"])
     return r.returncode == 0
 
 
@@ -802,12 +883,26 @@ def refresh_checks():
     log("ctl", "refresh complete", "ctl")
 
 
+def registry_export() -> dict:
+    """Governance-relevant view of the step registry (reviewed in PRs; checked by tools/validate.py)."""
+    def h(x):
+        return hashlib.sha256(x.encode()).hexdigest() if x else None
+    steps = [{"id": s["id"], "runner": s["runner"], "effect": s.get("effect"), "deps": s["deps"],
+              "any_of": s["any_of"], "needs": s.get("needs", []), "provides": s.get("provides", []),
+              "once": bool(s.get("once")), "danger": bool(s.get("danger")),
+              "hitl": bool(s.get("interaction")), "service": bool(s.get("service")),
+              "script_sha256": h(s["script"]), "check_sha256": h(s.get("check")),
+              "stop_sha256": h(s.get("stop"))} for s in STEPS]
+    return {"apiVersion": "vision.infra/v1", "kind": "StepRegistry",
+            "metadata": {"registrySha256": REGISTRY_SHA}, "spec": {"steps": steps}}
+
+
 def snapshot() -> dict:
     cfg = STORE.cfg()
     steps = []
     for s in STEPS:
         d = {"id": s["id"], "title": s["title"], "runner": s["runner"], "desc": s["desc"],
-             "deps": s["deps"], "needs": s.get("needs", []), "once": bool(s.get("once")),
+             "deps": s["deps"], "any_of": s.get("any_of", []), "needs": s.get("needs", []), "once": bool(s.get("once")),
              "hitl": bool(s.get("interaction")), "service": bool(s.get("service")),
              "danger": bool(s.get("danger")),
              "can_stop": bool(s.get("service") or s.get("stop") or s["runner"] == "cs"),
@@ -1002,7 +1097,12 @@ def main():
     if shutil.which("termux-wake-lock"):
         subprocess.run(["termux-wake-lock"], check=False)
 
+    ok, n, msg = verify_ledger()
+    print(f"Ledger: {n} records, {msg}. Registry sha256: {REGISTRY_SHA[:16]}")
+    ledger_append("startup", registry_sha=REGISTRY_SHA, ledger_ok=ok)
     replay_logs()
+    if not ok:
+        log("ctl", f"LEDGER VERIFICATION FAILED: {msg}. Preserve ledger.jsonl and investigate.", "err")
     recover()
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     srv.daemon_threads = True

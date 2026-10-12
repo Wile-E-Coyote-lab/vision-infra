@@ -1,0 +1,249 @@
+{
+  "apiVersion": "vision.infra/v1",
+  "kind": "StepRegistry",
+  "metadata": {
+    "registrySha256": "737fe6ec03dc33eb23d4d2ae92ca133e532577ee554d8d5e0100770e83d7c4df"
+  },
+  "spec": {
+    "steps": [
+      {
+        "any_of": [],
+        "check_sha256": null,
+        "danger": false,
+        "deps": [],
+        "effect": "read",
+        "hitl": false,
+        "id": "preflight",
+        "needs": [],
+        "once": false,
+        "provides": [
+          "owner"
+        ],
+        "runner": "local",
+        "script_sha256": "1484bc302f9db428f4071dd6384531deafcf96052bc613bef90ae7c6a3d893d3",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": "a7023b76926330da0b87f5c693af185b74e552b2e49741185de71a2513dd26a9",
+        "danger": false,
+        "deps": [
+          "preflight"
+        ],
+        "effect": "read",
+        "hitl": true,
+        "id": "token_scopes",
+        "needs": [],
+        "once": false,
+        "provides": [],
+        "runner": "local",
+        "script_sha256": "1dde591281275c5be998ea7860e7848e74427fbf8484388de3cda2aa9610c4b7",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": "43e0da1649cbb697929bae8e5c37e9c23d3ba24bc782ae95e9f52526bb1e5c0b",
+        "danger": false,
+        "deps": [
+          "token_scopes"
+        ],
+        "effect": "write",
+        "hitl": false,
+        "id": "repo",
+        "needs": [
+          "owner"
+        ],
+        "once": true,
+        "provides": [],
+        "runner": "local",
+        "script_sha256": "400151ffd86962dc55cd18d81d039b46972dc106659dd6d7c314bb9336d2c20b",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": "4e0849f9fd83d09394e953661e062cab3979b86f8be0c1c66a5cca83ed1553bc",
+        "danger": false,
+        "deps": [
+          "repo",
+          "token_scopes"
+        ],
+        "effect": "write",
+        "hitl": false,
+        "id": "codespace",
+        "needs": [
+          "owner"
+        ],
+        "once": false,
+        "provides": [
+          "cs_name"
+        ],
+        "runner": "local",
+        "script_sha256": "7dca6aca19844d285d001582cc81fa4876f42e749866160c6f9f8fac0122fb8e",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": null,
+        "danger": false,
+        "deps": [
+          "codespace"
+        ],
+        "effect": "read",
+        "hitl": false,
+        "id": "cs_ready",
+        "needs": [
+          "cs_name"
+        ],
+        "once": false,
+        "provides": [],
+        "runner": "local",
+        "script_sha256": "e4344364d0d42c86560085626f8cecea1550a371a79627910dbe6bdb4b9d72a6",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": null,
+        "danger": false,
+        "deps": [
+          "cs_ready"
+        ],
+        "effect": "write",
+        "hitl": false,
+        "id": "host_probe",
+        "needs": [
+          "cs_name"
+        ],
+        "once": false,
+        "provides": [],
+        "runner": "cs",
+        "script_sha256": "7103e4d6b228aff9ed3ca9dd966fb2eeefd5f385a18a4173621fb5441ba75b8a",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": "23f317bc684e48d5b63cf68660b52434c5f8eb079359c75bc51aa5c9741d69dd",
+        "danger": false,
+        "deps": [
+          "host_probe"
+        ],
+        "effect": "write",
+        "hitl": false,
+        "id": "redroid_up",
+        "needs": [
+          "cs_name"
+        ],
+        "once": false,
+        "provides": [],
+        "runner": "cs",
+        "script_sha256": "ab1d59383fc90e5ada2ced0da36623e97aaf6fa336d510898fab99139e0c1b83",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": null,
+        "danger": false,
+        "deps": [
+          "host_probe"
+        ],
+        "effect": "auth",
+        "hitl": false,
+        "id": "emu_key",
+        "needs": [
+          "cs_name"
+        ],
+        "once": false,
+        "provides": [],
+        "runner": "local",
+        "script_sha256": "74358978d89e8324d78848fb9da7b7d1fee1fee504ec2e4d6cf777208e08454f",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": "31b0ea856e0c8c5f9db67fbcbaf87b270bd2b2e8666ea9f26d2946599d0eda6b",
+        "danger": false,
+        "deps": [
+          "emu_key"
+        ],
+        "effect": "write",
+        "hitl": false,
+        "id": "emu_up",
+        "needs": [
+          "cs_name"
+        ],
+        "once": false,
+        "provides": [],
+        "runner": "cs",
+        "script_sha256": "be25e3cff4499c5784c58cc16bb612cf8a39a34f114a9d68bc9a75433fb758e5",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [
+          "redroid_up",
+          "emu_up"
+        ],
+        "check_sha256": null,
+        "danger": false,
+        "deps": [
+          "host_probe"
+        ],
+        "effect": "write",
+        "hitl": false,
+        "id": "portfwd",
+        "needs": [
+          "cs_name"
+        ],
+        "once": false,
+        "provides": [],
+        "runner": "local",
+        "script_sha256": "794084e3c75b0508d98515b2a6715d7cff9cc10b4925ac4fb76605ed86ee8e18",
+        "service": true,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": "9fc40f09dd797a378a21f854e3deba65683af573ec74138ec8773fe6943654d5",
+        "danger": false,
+        "deps": [
+          "portfwd"
+        ],
+        "effect": "write",
+        "hitl": false,
+        "id": "adb_connect",
+        "needs": [],
+        "once": false,
+        "provides": [],
+        "runner": "local",
+        "script_sha256": "d3dc8e827c8130483a9e0cc861ee5e6bad5c5f14165efeed62d018dbd1c42660",
+        "service": false,
+        "stop_sha256": null
+      },
+      {
+        "any_of": [],
+        "check_sha256": null,
+        "danger": false,
+        "deps": [],
+        "effect": "write",
+        "hitl": false,
+        "id": "cs_stop",
+        "needs": [
+          "cs_name"
+        ],
+        "once": false,
+        "provides": [],
+        "runner": "local",
+        "script_sha256": "15327989166d96cf37798df14ca803b7144ef27c8a42c94b6e6ebbd0237f85ed",
+        "service": false,
+        "stop_sha256": null
+      }
+    ]
+  }
+}

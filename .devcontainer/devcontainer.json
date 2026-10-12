@@ -1,16 +1,12 @@
 {
-  "name": "vision-infra control plane",
+  // Lean control-plane + Redroid host Codespace (no gcloud/terraform: no cloud account needed).
+  // The GCP variant lives in .devcontainer/gcp/devcontainer.json
+  "name": "vision-infra codespace host",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
   "features": {
-    "ghcr.io/devcontainers/features/sshd:1": {
-      "version": "latest"
-    },
-    "ghcr.io/devcontainers/features/terraform:1": {},
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {
-      "moby": false
-    },
-    "ghcr.io/devcontainers/features/github-cli:1": {},
-    "ghcr.io/dhoeric/features/google-cloud-cli:1": {}
+    "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": false },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
   },
   "hostRequirements": { "cpus": 2 }
 }

@@ -1,0 +1,19 @@
+{
+  "apiVersion": "vision.infra/v1",
+  "kind": "IdentityRegistry",
+  "metadata": {
+    "purpose": "Default-deny registry of everything the controller may contact or trust. Adding an entry is a reviewed PR."
+  },
+  "spec": {
+    "egress": [
+      {"host": "github.com", "purpose": "repo, token settings page", "lifecycle": "active", "review_by": "2027-04-11"},
+      {"host": "api.github.com", "purpose": "GitHub REST API", "lifecycle": "active", "review_by": "2027-04-11"}
+    ],
+    "images": [
+      {"id": "redroid", "ref": "redroid/redroid:13.0.0-latest", "pin": null, "purpose": "Engine A (needs binder)", "lifecycle": "active", "review_by": "2027-04-11"},
+      {"id": "android-emulator-api30", "ref": "us-docker.pkg.dev/android-emulator-268719/images/30-google-x64:30.1.2", "pin": null, "purpose": "Engine B (needs KVM)", "lifecycle": "active", "review_by": "2027-04-11"}
+    ],
+    "mcp_servers": [],
+    "rag_sources": []
+  }
+}
