@@ -1,5 +1,14 @@
 {
   "scene": "DATURA — Scene 01",
   "projection": "equirectangular",
-  "aspectRatio": "2:1"
+  "aspectRatio": "2:1",
+  "storyboard": [
+    { "time": 0, "target": "altar" },
+    { "time": 5, "target": "red window" },
+    { "time": 10, "target": "visor" }
+  ],
+  "anchors": {
+    "emerald-anchor": [0, 1.2, -5],
+    "blue-lines-anchor": [0, 0.1, -3]
+  }
 }
