@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0d12">
+  <title>{{ page.title | default: site.title }}</title>
+  <link rel="manifest" href="{{ '/manifest.json' | relative_url }}">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/aframe/1.7.0/aframe.min.js"></script>
+</head>
+<body>
+  <a-scene vr-mode-ui="enabled: true" renderer="antialias: true; colorManagement: true">
+    <a-assets timeout="15000">
+      <video id="daturaVideo"
+             src="{{ page.video | default: '/assets/video/scene-01-equirect.mp4' | relative_url }}"
+             poster="{{ page.poster | default: '/assets/video/scene-01-poster.jpg' | relative_url }}"
+             autoplay loop muted playsinline webkit-playsinline crossorigin="anonymous"></video>
+    </a-assets>
+    <a-videosphere src="#daturaVideo" rotation="0 180 0"></a-videosphere>
+    <a-link href="{{ page.next_scene | default: '/scene2.html' | relative_url }}"
+            position="0 1.6 -3"
+            title="{{ page.next_title | default: 'Next Scene' }}"></a-link>
+    <a-entity id="rig" position="0 1.6 0">
+      <a-entity camera look-controls wasd-controls>
+        <a-cursor fuse="true" fuse-timeout="1500"></a-cursor>
+      </a-entity>
+    </a-entity>
+  </a-scene>
+</body>
+</html>
