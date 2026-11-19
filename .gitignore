@@ -3,3 +3,4 @@ state.json
 state.tmp
 ledger.jsonl
 __pycache__/
+node_modules/
