@@ -1,4 +1,275 @@
----
-layout: vr
-title: DATURA — Scene 01
----
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>nanobananas VR</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/aframe/1.7.0/aframe.min.js"
+          integrity="sha512-placeholder-pin-after-first-run"
+          crossorigin="anonymous"></script>
+  <style>
+    body { margin: 0; background: #000; font-family: sans-serif; }
+    #loader {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: #000; color: #fff; z-index: 100;
+    }
+    #loader p  { opacity: .6; font-size: .9rem; margin-top: .5rem; }
+    #error-box {
+      position: fixed; inset: 0;
+      display: none; align-items: center; justify-content: center;
+      background: #000; color: #f55; font-size: 1.1rem; z-index: 200;
+      padding: 2rem; text-align: center;
+    }
+    #ui-overlay {
+      position: fixed; bottom: env(safe-area-inset-bottom, 0);
+      left: 0; right: 0;
+      display: flex; justify-content: center; gap: .5rem;
+      padding: .75rem; z-index: 50; pointer-events: none;
+    }
+    .scene-btn {
+      pointer-events: all;
+      background: rgba(255,255,255,.15);
+      border: 1px solid rgba(255,255,255,.35);
+      color: #fff; border-radius: 999px;
+      padding: .4rem .9rem; font-size: .8rem;
+      cursor: pointer; backdrop-filter: blur(6px);
+      max-width: 160px; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .scene-btn.active { background: rgba(255,255,255,.35); }
+  </style>
+</head>
+<body>
+
+<div id="loader">
+  <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+    <circle cx="24" cy="24" r="20" stroke="#444" stroke-width="4"/>
+    <path d="M24 4 a20 20 0 0 1 20 20" stroke="#fff" stroke-width="4"
+          stroke-linecap="round">
+      <animateTransform attributeName="transform" type="rotate"
+        from="0 24 24" to="360 24 24" dur="1s" repeatCount="indefinite"/>
+    </path>
+  </svg>
+  <p id="loader-msg">Loading scene…</p>
+</div>
+
+<div id="error-box"></div>
+
+<a-scene id="vr-scene"
+         vr-mode-ui="enabled: true"
+         loading-screen="enabled: false"
+         renderer="antialias: true; colorManagement: true">
+
+  <a-assets id="a-assets" timeout="30000">
+    <!-- populated by JS -->
+  </a-assets>
+
+  <!-- active sky -->
+  <a-videosphere id="sky" rotation="0 180 0"></a-videosphere>
+
+  <!-- portal ring — populated by JS -->
+  <a-entity id="portals"></a-entity>
+
+  <a-camera>
+    <a-cursor fuse="true" fuse-timeout="1500"
+              color="#fff" opacity="0.8"
+              geometry="primitive: ring; radiusInner: 0.01; radiusOuter: 0.015"
+              animation__click="property: scale; startEvents: click;
+                                from: 1 1 1; to: 0.1 0.1 0.1; dur: 150;
+                                easing: easeInCubic"
+              animation__restore="property: scale; startEvents: mouseup;
+                                  to: 1 1 1; dur: 150">
+    </a-cursor>
+  </a-camera>
+</a-scene>
+
+<!-- scene title HUD -->
+<div id="ui-overlay"></div>
+
+<script>
+(async function () {
+  const loader    = document.getElementById('loader');
+  const loaderMsg = document.getElementById('loader-msg');
+  const errBox    = document.getElementById('error-box');
+  const assets    = document.getElementById('a-assets');
+  const sky       = document.getElementById('sky');
+  const portals   = document.getElementById('portals');
+  const uiBar     = document.getElementById('ui-overlay');
+
+  function fatal(msg) {
+    loader.style.display    = 'none';
+    errBox.style.display    = 'flex';
+    errBox.textContent      = msg;
+  }
+
+  // ── 1. load manifest ───────────────────────────────────────────────────
+  loaderMsg.textContent = 'Loading manifest…';
+  let manifest;
+  try {
+    const r = await fetch('manifest.json?_=' + Date.now());
+    if (!r.ok) throw new Error(r.status);
+    manifest = await r.json();
+  } catch (e) {
+    fatal('Could not load manifest.json. Run the pipeline first. (' + e + ')');
+    return;
+  }
+
+  const scenes = manifest.scenes || [];
+  if (!scenes.length) {
+    fatal('No scenes yet. Run: ./pipeline.sh "your prompt"');
+    return;
+  }
+
+  // ── 2. determine active scene (hash or first) ──────────────────────────
+  function sceneById(id) {
+    return scenes.find(s => s.id === id) || scenes[0];
+  }
+
+  function activeId() {
+    const h = location.hash.replace('#', '');
+    return h && scenes.find(s => s.id === h) ? h : scenes[0].id;
+  }
+
+  // ── 3. render scene ────────────────────────────────────────────────────
+  const loaded = {};   // id → <video> element
+
+  function ensureVideo(scene) {
+    if (loaded[scene.id]) return loaded[scene.id];
+    const v   = document.createElement('video');
+    v.id      = 'vid-' + scene.id;
+    v.src     = scene.video;
+    v.loop    = true;
+    v.muted   = true;
+    v.setAttribute('crossorigin', 'anonymous');
+    v.setAttribute('playsinline', '');
+    v.setAttribute('webkit-playsinline', '');
+    v.setAttribute('preload', 'auto');
+    assets.appendChild(v);
+    loaded[scene.id] = v;
+    return v;
+  }
+
+  function switchScene(scene) {
+    loaderMsg.textContent = 'Loading ' + (scene.title || scene.id) + '…';
+    loader.style.display  = 'flex';
+
+    const vid = ensureVideo(scene);
+
+    // pause all others
+    Object.entries(loaded).forEach(([id, v]) => {
+      if (id !== scene.id) v.pause();
+    });
+
+    sky.setAttribute('src', '#vid-' + scene.id);
+
+    vid.play().catch(() => {
+      // autoplay blocked — tap to play overlay handled by A-Frame
+    });
+
+    vid.addEventListener('loadeddata', function once() {
+      vid.removeEventListener('loadeddata', once);
+      loader.style.display = 'none';
+    }, { once: true });
+
+    // update hash without reload
+    history.replaceState(null, '', '#' + scene.id);
+
+    buildUI(scene);
+    buildPortals(scene);
+  }
+
+  // ── 4. portal ring ─────────────────────────────────────────────────────
+  function buildPortals(active) {
+    portals.innerHTML = '';
+    const others = scenes.filter(s => s.id !== active.id).slice(0, 5);
+    if (!others.length) return;
+
+    const step = (2 * Math.PI) / others.length;
+    others.forEach((s, i) => {
+      const angle  = i * step;
+      const radius = 4;
+      const x      = (radius * Math.sin(angle)).toFixed(2);
+      const z      = (-radius * Math.cos(angle)).toFixed(2);
+
+      const link   = document.createElement('a-entity');
+      link.setAttribute('position', `${x} 1.6 ${z}`);
+      link.setAttribute('look-at', '0 1.6 0');
+
+      // ring
+      const ring = document.createElement('a-torus');
+      ring.setAttribute('color', '#ffffff');
+      ring.setAttribute('opacity', '0.4');
+      ring.setAttribute('radius', '0.35');
+      ring.setAttribute('radius-tubular', '0.02');
+      ring.setAttribute('animation__hover', 'property: opacity; to: 0.9; dur: 200; startEvents: mouseenter');
+      ring.setAttribute('animation__out',   'property: opacity; to: 0.4; dur: 200; startEvents: mouseleave');
+      ring.setAttribute('class', 'clickable');
+
+      // label
+      const text = document.createElement('a-text');
+      const label = (s.title || s.id).substring(0, 28);
+      text.setAttribute('value', label);
+      text.setAttribute('align', 'center');
+      text.setAttribute('position', '0 -0.5 0');
+      text.setAttribute('width', '1.4');
+      text.setAttribute('color', '#fff');
+      text.setAttribute('wrap-count', '20');
+
+      // poster preview (if available)
+      if (s.poster) {
+        const img = document.createElement('a-image');
+        img.setAttribute('src', s.poster);
+        img.setAttribute('width', '0.6');
+        img.setAttribute('height', '0.3');
+        img.setAttribute('position', '0 0 0');
+        img.setAttribute('opacity', '0.85');
+        link.appendChild(img);
+      }
+
+      // click handler
+      link.addEventListener('click', () => switchScene(s));
+      ring.addEventListener('click', () => switchScene(s));
+
+      link.appendChild(ring);
+      link.appendChild(text);
+      portals.appendChild(link);
+    });
+  }
+
+  // ── 5. bottom UI bar ───────────────────────────────────────────────────
+  function buildUI(active) {
+    uiBar.innerHTML = '';
+    scenes.forEach(s => {
+      const btn = document.createElement('button');
+      btn.className  = 'scene-btn' + (s.id === active.id ? ' active' : '');
+      btn.textContent = s.title ? s.title.substring(0, 22) : s.id;
+      btn.title       = s.title || s.id;
+      btn.onclick     = () => switchScene(s);
+      uiBar.appendChild(btn);
+    });
+  }
+
+  // ── 6. handle hash navigation ──────────────────────────────────────────
+  window.addEventListener('hashchange', () => {
+    switchScene(sceneById(activeId()));
+  });
+
+  // ── 7. boot ────────────────────────────────────────────────────────────
+  // preload active scene video before scene shows
+  const first = sceneById(activeId());
+  ensureVideo(first);                     // adds <video> to <a-assets>
+
+  // wait for A-Frame to be ready, then switch
+  const aScene = document.getElementById('vr-scene');
+  if (aScene.hasLoaded) {
+    switchScene(first);
+  } else {
+    aScene.addEventListener('loaded', () => switchScene(first));
+  }
+
+})();
+</script>
+</body>
+</html>

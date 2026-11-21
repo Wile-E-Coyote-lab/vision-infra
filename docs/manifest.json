@@ -5,5 +5,18 @@
   "scope": "/vision-infra/",
   "display": "standalone",
   "background_color": "#0b0d12",
-  "theme_color": "#0b0d12"
+  "theme_color": "#0b0d12",
+  "scenes": [
+    {
+      "id": "scene-20261121-133722",
+      "title": "Equirectangular 360 panorama video, 2:1 aspect ratio, seamless wraparound",
+      "prompt": "Equirectangular 360 panorama video, 2:1 aspect ratio, seamless wraparound",
+      "video": "assets/video/scene-20261121-133722-equirect.mp4",
+      "poster": "assets/video/scene-20261121-133722-poster.jpg",
+      "resolution": "1280x640",
+      "duration_s": 6,
+      "source": "local-ffmpeg-2:1",
+      "generated_at": "2026-11-21T13:37:32Z"
+    }
+  ]
 }
