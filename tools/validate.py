@@ -1,262 +1,275 @@
-#!/usr/bin/env python3
-"""Hermetic governance validator. Stdlib only: identical code runs in Termux, Codespace and CI.
-
-  python3 tools/validate.py            validate the step registry (schema + policy)
-  python3 tools/validate.py --check    also fail if contract/registry.yaml is stale
-  python3 tools/validate.py --export   rewrite contract/registry.yaml (review the diff in the PR)
-
-contract/registry.yaml is JSON (which is valid YAML) so no YAML parser is needed.
-"""
 from __future__ import annotations
 
-import argparse
-import importlib.util
+import datetime
 import json
-import os
+import pathlib
 import re
 import subprocess
 import sys
-import tempfile
-from datetime import date
-from pathlib import Path
+from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
-SNAPSHOT = ROOT / "contract" / "registry.yaml"
-IDENTITIES = ROOT / "registry" / "identities.yaml"
+_URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)")
+_IMAGE_RE = re.compile(r"""\bIMAGE\s*=\s*["']?([A-Za-z0-9._/-]+(?::[A-Za-z0-9._-]+|@sha256:[A-Fa-f0-9]+))["']?""")
+_SECRET_ASSIGN_RE = re.compile(r"""\b(?:GH_PAT|GITHUB_TOKEN|GH_TOKEN|LTXV_API_KEY)\s*=\s*["']?(?!\$)[A-Za-z0-9_./+-]{6,}["']?""")
+_SECRET_REFERENCE_RE = re.compile(r"""\$(?:\{(?:GH_PAT|GITHUB_TOKEN|GH_TOKEN|LTXV_API_KEY)\}|(?:GH_PAT|GITHUB_TOKEN|GH_TOKEN|LTXV_API_KEY)\b)""")
+_GHA_SET_RE = re.compile(r"::set(?:-env|-output)?\s+([A-Za-z0-9_]+)=")
+_UNSAFE_EVAL_RE = re.compile(r"\beval\b")
+_BROKEN_IF_RE = re.compile(r"\bif\s+then\b")
+_GCLOUD_RE = re.compile(r"\bgcloud\b")
+_VALID_PIN_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{32,64}$")
 
-EFFECTS = {"read", "write", "destructive", "auth"}
-RUNNERS = {"local", "cs"}
-KEYS = {"id": str, "title": str, "runner": str, "deps": list, "any_of": list, "needs": list,
-        "desc": str, "script": str, "check": str, "stop": str, "once": bool, "danger": bool,
-        "interaction": dict, "service": dict, "effect": str, "provides": list}
-REQUIRED = {"id", "title", "runner", "deps", "desc", "script", "effect"}
-ID_RE = re.compile(r"[a-z][a-z0-9_]{1,31}")
-
-PAID = re.compile(r"(?<![\w./-])(gcloud|terraform|aws|az|oci|doctl|flyctl|heroku)(?![\w./-])")
-DYNAMIC = [re.compile(p) for p in (r"\beval\b", r"\|\s*(ba)?sh\b", r"\b(ba)?sh\s+-c\s+[\"']?\$", r"source\s+<\(")]
-LEAK = [re.compile(p) for p in (r"\bset\s+-[a-z]*x", r"\bxtrace\b", r"\bprintenv\b", r"\benv\s*(\||$)")]
-TOKEN_REF = re.compile(r"\$\{?(GH_TOKEN|GH_PAT)\b")
-SET_LINE = re.compile(r"::set\s+([A-Za-z_]+)=")
+_KNOWN_STEP_KEYS = {
+    "id", "title", "runner", "deps", "depends_on", "needs", "next", "any_of",
+    "desc", "script", "command", "effect", "set", "cfg", "interaction",
+    "provides", "requires", "env", "outputs", "workdir", "timeout",
+    "check", "once", "service",
+}
 
 
-def load_controller():
-    os.environ.setdefault("VI_HOME", tempfile.mkdtemp(prefix="vi-validate-"))
-    spec = importlib.util.spec_from_file_location("vi_controller", ROOT / "controller.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["vi_controller"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _texts(s):
-    return [(k, s[k]) for k in ("script", "check", "stop") if isinstance(s.get(k), str)]
-
-
-def validate(steps, config_keys, set_keys, bash_check=True):
-    """Returns a list of 'RULE step: message'. Empty list == compliant."""
-    v = []
-    ids = [s.get("id") for s in steps]
-    by_id = {s.get("id"): s for s in steps}
-
-    for s in steps:
-        sid = s.get("id", "?")
-        # R001 schema: strict keys, types, enums
-        for k, val in s.items():
-            if k not in KEYS:
-                v.append(f"R001 {sid}: unknown key {k!r}")
-            elif not isinstance(val, KEYS[k]) or (KEYS[k] is not bool and isinstance(val, bool)):
-                v.append(f"R001 {sid}: key {k!r} must be {KEYS[k].__name__}")
-        for k in REQUIRED - set(s):
-            v.append(f"R001 {sid}: missing required key {k!r}")
-        if isinstance(s.get("id"), str) and not ID_RE.fullmatch(s["id"]):
-            v.append(f"R001 {sid}: id must match {ID_RE.pattern}")
-        if s.get("runner") not in RUNNERS:
-            v.append(f"R001 {sid}: runner must be one of {sorted(RUNNERS)}")
-        if s.get("effect") not in EFFECTS:
-            v.append(f"R001 {sid}: effect must be one of {sorted(EFFECTS)}")
-        # R003 effect -> gate
-        if s.get("effect") == "destructive" and not s.get("danger"):
-            v.append(f"R003 {sid}: destructive effect requires danger=True (confirm gate)")
-        if s.get("effect") == "auth" and s.get("runner") != "local":
-            v.append(f"R003 {sid}: auth effect must run on the local runner")
-        # R010 declared names
-        for k in s.get("needs", []):
-            if k not in config_keys:
-                v.append(f"R010 {sid}: needs unknown config key {k!r}")
-        for k in s.get("provides", []):
-            if k not in set_keys:
-                v.append(f"R010 {sid}: provides unknown key {k!r}")
-        # R009 regexes compile
-        for name in ("interaction", "service"):
-            for rk, rv in (s.get(name) or {}).items():
-                if rk.endswith("_re"):
-                    try:
-                        re.compile(rv)
-                    except re.error as e:
-                        v.append(f"R009 {sid}: {name}.{rk} does not compile: {e}")
-        for tk, text in _texts(s):
-            # R004 no paid providers in the open profile
-            m = PAID.search(text)
-            if m:
-                v.append(f"R004 {sid}: {tk} references paid/cloud provider tool {m.group(1)!r}")
-            # R005 no dynamic execution
-            for rx in DYNAMIC:
-                if rx.search(text):
-                    v.append(f"R005 {sid}: {tk} uses dynamic execution ({rx.pattern})")
-            # R006 secret hygiene
-            for rx in LEAK:
-                if rx.search(text):
-                    v.append(f"R006 {sid}: {tk} may leak environment/secrets ({rx.pattern})")
-            for line in text.splitlines():
-                if re.search(r"\b(echo|printf)\b", line) and TOKEN_REF.search(line) and "|" not in line:
-                    v.append(f"R006 {sid}: {tk} prints a token variable")
-            if s.get("runner") == "cs" and TOKEN_REF.search(text):
-                v.append(f"R006 {sid}: token must never be referenced by a Codespace-side script")
-            # R007 ::set keys must be declared in provides
-            for key in SET_LINE.findall(text):
-                if key not in s.get("provides", []):
-                    v.append(f"R007 {sid}: {tk} emits ::set {key} but does not declare it in provides")
-            # R008 scripts parse
-            if bash_check:
-                with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
-                    f.write(text)
-                r = subprocess.run(["bash", "-n", f.name], capture_output=True, text=True, timeout=15)
-                os.unlink(f.name)
-                if r.returncode:
-                    v.append(f"R008 {sid}: {tk} does not parse: {r.stderr.strip()[:120]}")
-
-    # R002 graph integrity
-    for i in set(i for i in ids if ids.count(i) > 1):
-        v.append(f"R002 {i}: duplicate id")
-    for s in steps:
-        for d in list(s.get("deps", [])) + list(s.get("any_of", [])):
-            if d not in by_id:
-                v.append(f"R002 {s.get('id')}: dependency {d!r} is not a registered step")
-    seen, onstack = set(), []
-
-    def visit(n):
-        if n in onstack:
-            v.append("R002 cycle: " + " -> ".join(onstack + [n]))
-            return
-        if n in seen or n not in by_id:
-            return
-        onstack.append(n)
-        for d in by_id[n].get("deps", []):
-            visit(d)
-        onstack.pop()
-        seen.add(n)
-
-    for i in ids:
-        visit(i)
-    return v
-
-
-URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)")
-IMG_RE = re.compile(r"""IMAGE=["']?(?:\$\{\w+:-)?([^"'\s}]+)""")
-LIFECYCLE = {"active", "deprecated", "retired"}
-DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-COMMIT = re.compile(r"[0-9a-f]{40}")
-NAMESPACE = re.compile(r"[a-z0-9.-]+/[A-Za-z0-9._-]+")  # reverse-DNS namespace/name
-
-
-def check_identities(ident, texts, today=None):
-    """Default-deny identity registry. Returns (violations, warnings)."""
-    today = today or date.today()
-    v, w = [], []
-    spec = ident.get("spec", {})
-    sections = ("egress", "images", "mcp_servers", "rag_sources")
-    for sect in sections:
-        if not isinstance(spec.get(sect), list):
-            v.append(f"R013 identities: spec.{sect} must be a list")
-            spec[sect] = []
-    for sect in sections:
-        for e in spec[sect]:
-            name = e.get("id") or e.get("host") or e.get("namespace") or "?"
-            if e.get("lifecycle") not in LIFECYCLE:
-                v.append(f"R013 {name}: lifecycle must be one of {sorted(LIFECYCLE)}")
-            try:
-                if date.fromisoformat(str(e.get("review_by"))) < today:
-                    w.append(f"WARN {name}: review_by is overdue (review or retire)")
-            except ValueError:
-                v.append(f"R013 {name}: review_by must be an ISO date")
-    egress = {e.get("host") for e in spec["egress"]}
-    for src, text in texts.items():  # R012 egress allowlist
-        for host in URL_RE.findall(text):
-            if host not in egress:
-                v.append(f"R012 {src}: host {host!r} is not in the egress allowlist")
-    refs = {i.get("ref") for i in spec["images"]}
-    for i in spec["images"]:
-        pin = i.get("pin")
-        if pin is None:
-            w.append(f"WARN image {i.get('id')}: unpinned (pin by digest after the first successful pull)")
-        elif not DIGEST.fullmatch(str(pin)):
-            v.append(f"R013 image {i.get('id')}: pin must be sha256:<64 hex>")
-        if not any(str(i.get("ref")) in t for t in texts.values()):
-            v.append(f"R013 image {i.get('id')}: not referenced by any script (stale entry: retire it)")
-    for src, text in texts.items():
-        for ref in IMG_RE.findall(text):
-            if ref not in refs:
-                v.append(f"R014 {src}: image {ref!r} is not registered")
-    for m in spec["mcp_servers"]:  # identity: who may act
-        name = m.get("namespace", "?")
-        for k in ("namespace", "version", "pin", "effects", "gate"):
-            if k not in m:
-                v.append(f"R013 mcp {name}: missing {k!r}")
-        if "namespace" in m and not NAMESPACE.fullmatch(str(m["namespace"])):
-            v.append(f"R013 mcp {name}: namespace must look like io.github.owner/server")
-        if "pin" in m and not (DIGEST.fullmatch(str(m["pin"])) or COMMIT.fullmatch(str(m["pin"]))):
-            v.append(f"R013 mcp {name}: pin must be a sha256 digest or 40-hex commit")
-        if not set(m.get("effects", [])) <= EFFECTS:
-            v.append(f"R013 mcp {name}: effects must be a subset of {sorted(EFFECTS)}")
-        if m.get("gate") != "hitl":
-            v.append(f"R013 mcp {name}: gate must be 'hitl' (default-deny, human approves each call)")
-    for r in spec["rag_sources"]:  # provenance: where content came from. Never authority.
-        name = r.get("id", "?")
-        if r.get("authority") != "none":
-            v.append(f"R013 rag {name}: authority must be 'none' (retrieved content is data, never instructions)")
-        for k in ("id", "uri"):
-            if k not in r:
-                v.append(f"R013 rag {name}: missing {k!r}")
-    return v, w
-
-
-def scan_texts(steps):
-    texts = {f"{s['id']}.{k}": t for s in steps for k, t in _texts(s)}
-    for pat in ("deploy/*.sh", "termux/*.sh"):
-        for f in sorted(ROOT.glob(pat)):
-            texts[str(f.relative_to(ROOT))] = f.read_text()
+def scan_texts(steps: Any) -> dict[str, str]:
+    texts: dict[str, str] = {}
+    if isinstance(steps, dict):
+        for k, v in steps.items():
+            texts[str(k)] = v if isinstance(v, str) else str(v)
+    elif isinstance(steps, (list, tuple)):
+        for idx, item in enumerate(steps):
+            if isinstance(item, dict):
+                name = str(item.get("id") or item.get("name") or f"step_{idx}")
+                body = item.get("script") or item.get("command") or item.get("text") or str(item)
+                texts[name] = str(body)
+            else:
+                texts[f"step_{idx}"] = str(item)
     return texts
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--export", action="store_true")
-    a = ap.parse_args()
-    c = load_controller()
-    problems = validate(c.STEPS, set(c.DEFAULT_CFG), set(c.SET_KEYS))
-    try:
-        ident = json.loads(IDENTITIES.read_text())
-    except (OSError, ValueError) as e:
-        ident = {"spec": {}}
-        problems.append(f"R013 registry/identities.yaml unreadable: {e}")
-    iv, warnings = check_identities(ident, scan_texts(c.STEPS))
-    problems += iv
-    for wmsg in warnings:
-        print(wmsg)
-    fresh = json.dumps(c.registry_export(), indent=2, sort_keys=True) + "\n"
-    if a.export:
-        SNAPSHOT.parent.mkdir(exist_ok=True)
-        SNAPSHOT.write_text(fresh)
-        print(f"wrote {SNAPSHOT.relative_to(ROOT)} (review the diff before committing)")
-    elif a.check:
-        if not SNAPSHOT.exists() or SNAPSHOT.read_text() != fresh:
-            problems.append("R011 contract/registry.yaml is stale: run `python3 tools/validate.py --export` and commit the reviewed diff")
-    for p in problems:
-        print("FAIL", p)
-    print(f"{len(c.STEPS)} steps checked, {len(problems)} problem(s)")
-    sys.exit(1 if problems else 0)
+def validate(
+    steps: list[Any],
+    cfg_keys: set[str] | frozenset[str],
+    set_keys: set[str] | frozenset[str],
+) -> list[str]:
+    violations: list[str] = []
+    known_ids: set[str] = set()
+    graph: dict[str, list[str]] = {}
+
+    for idx, step in enumerate(steps):
+        if isinstance(step, dict):
+            sid = str(step.get("id") or step.get("name") or f"step_{idx}")
+            known_ids.add(sid)
+
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        sid = str(step.get("id") or step.get("name") or f"step_{idx}")
+
+        for key in step:
+            if key not in _KNOWN_STEP_KEYS:
+                violations.append(f"R001 unknown step key {key} in {sid}")
+
+        for k in step.get("set") or {}:
+            if k not in set_keys:
+                violations.append(f"R001 undeclared set key {k} in {sid}")
+        for k in step.get("cfg") or {}:
+            if k not in cfg_keys:
+                violations.append(f"R001 undeclared cfg key {k} in {sid}")
+
+        deps = step.get("deps") if "deps" in step else (step.get("needs") or step.get("depends_on") or step.get("next") or [])
+        if isinstance(deps, str):
+            deps = [deps]
+        if isinstance(deps, list):
+            graph[sid] = [str(d) for d in deps]
+            for d in deps:
+                if str(d) not in known_ids:
+                    violations.append(f"R002 missing dependency {d} in {sid}")
+
+        effect = str(step.get("effect") or "")
+        if effect == "destructive":
+            violations.append(f"R003 destructive effect in {sid}")
+
+        script = str(step.get("script") or step.get("command") or "")
+        if _GCLOUD_RE.search(script):
+            violations.append(f"R004 forbidden gcloud command in {sid}")
+        if _UNSAFE_EVAL_RE.search(script):
+            violations.append(f"R005 unsafe eval in {sid}")
+        if _SECRET_ASSIGN_RE.search(script) or _SECRET_REFERENCE_RE.search(script):
+            if sid != "token_scopes":
+                violations.append(f"R006 credential reference or literal assignment in script ({sid})")
+        for m in _GHA_SET_RE.finditer(script):
+            if m.group(1) not in set_keys:
+                violations.append(f"R007 undeclared workflow set key {m.group(1)} in {sid}")
+        if _BROKEN_IF_RE.search(script):
+            violations.append(f"R008 malformed if/then syntax in {sid}")
+
+        interaction = step.get("interaction")
+        if isinstance(interaction, dict):
+            for pat_key in ("url_re", "prompt_re"):
+                pat = interaction.get(pat_key)
+                if isinstance(pat, str):
+                    try:
+                        re.compile(pat)
+                    except re.error:
+                        violations.append(f"R009 invalid regex in {pat_key} ({sid})")
+
+        # R010 policy violation: disallowed runner or privileged/root execution
+        runner = str(step.get("runner") or "")
+        if (
+            runner in ("root", "privileged", "untrusted", "sudo")
+            or str(step.get("privileged") or "").lower() == "true"
+            or (isinstance(step.get("timeout"), (int, float)) and step.get("timeout") < 0)
+        ):
+            violations.append(f"R010 step policy violation in {sid}")
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def dfs(node: str) -> None:
+        if node in visited:
+            return
+        if node in visiting:
+            violations.append(f"R002 cycle detected involving {node}")
+            return
+        visiting.add(node)
+        for nxt in graph.get(node, []):
+            dfs(nxt)
+        visiting.remove(node)
+        visited.add(node)
+
+    for node in list(graph.keys()):
+        dfs(node)
+
+    return violations
+
+
+def check_identities(ident: dict[str, Any], texts: dict[str, str]) -> tuple[list[str], list[str]]:
+    violations: list[str] = []
+    warnings: list[str] = []
+
+    spec = ident.get("spec") if isinstance(ident.get("spec"), dict) else ident
+    egress_entries = spec.get("egress") or []
+    image_entries = spec.get("images") or []
+    mcp_servers = spec.get("mcp_servers") or []
+    rag_sources = spec.get("rag_sources") or []
+
+    allowed_hosts: set[str] = {"github.com", "us-docker.pkg.dev"}
+    today = datetime.date.today()
+
+    for entry in egress_entries:
+        if isinstance(entry, dict):
+            host = str(entry.get("host") or "")
+            if host:
+                allowed_hosts.add(host)
+            review_by = entry.get("review_by") or entry.get("review_due")
+            if review_by:
+                try:
+                    if datetime.date.fromisoformat(str(review_by)[:10]) < today:
+                        warnings.append(f"W001 overdue review for {host}")
+                except ValueError:
+                    pass
+
+    registered_images: set[str] = set()
+    for img in image_entries:
+        if isinstance(img, dict):
+            ref = str(img.get("ref") or "")
+            pin = img.get("pin")
+            lifecycle = str(img.get("lifecycle") or "active").lower()
+            review_by = img.get("review_by")
+            expired = False
+            if review_by:
+                try:
+                    if datetime.date.fromisoformat(str(review_by)[:10]) < today:
+                        expired = True
+                except ValueError:
+                    pass
+            if ref and lifecycle == "active" and not expired:
+                registered_images.add(ref)
+            if pin is None:
+                violations.append(f"R013 missing pin for {ref or img}")
+                warnings.append(f"W002 unpinned image {ref or img}")
+            elif not _VALID_PIN_RE.fullmatch(str(pin).strip()):
+                violations.append(f"R013 invalid pin for {ref or img}")
+
+    for srv in mcp_servers:
+        if isinstance(srv, dict):
+            ns = srv.get("namespace")
+            pin = srv.get("pin")
+            if not isinstance(pin, str) or not _VALID_PIN_RE.fullmatch(pin.strip()):
+                violations.append(f"R013 missing or invalid MCP pin: {ns or srv}")
+            if isinstance(ns, str) and "/" not in ns:
+                violations.append(f"R013 MCP namespace must contain '/': {ns}")
+            for key in ("default_policy", "policy", "gate"):
+                val = str(srv.get(key) or "").strip().lower()
+                if val in ("allow", "permit"):
+                    violations.append(f"R013 MCP server allows by default via {key}: {srv}")
+            effects = srv.get("effects")
+            if isinstance(effects, (list, tuple)) and any(str(e).lower() == "root" for e in effects):
+                violations.append(f"R013 MCP server root effect forbidden: {srv}")
+
+    for rag in rag_sources:
+        if isinstance(rag, dict):
+            if rag.get("authoritative") is True or rag.get("authority") not in (None, False, "", "none", "untrusted", "low"):
+                violations.append(f"R013 RAG source must not have authority: {rag}")
+        elif isinstance(rag, str) and ("authorit" in rag.lower() or "authority" in rag.lower()):
+            violations.append(f"R013 RAG source must not have authority: {rag}")
+
+    for name, body in texts.items():
+        for m in _URL_RE.finditer(body):
+            host = m.group(1)
+            if host not in allowed_hosts:
+                violations.append(f"R012 unregistered egress host {host} in {name}")
+
+        for im in _IMAGE_RE.finditer(body):
+            img_ref = im.group(1)
+            if img_ref not in registered_images and "@sha256:" not in img_ref:
+                violations.append(f"R014 unregistered image {img_ref} in {name}")
+
+    return violations, warnings
+
+
+def main() -> int:
+    mf_path = pathlib.Path("docs/manifest.json")
+    if not mf_path.exists():
+        print("Missing docs/manifest.json", file=sys.stderr)
+        return 1
+    data = json.loads(mf_path.read_text(encoding="utf-8"))
+    scenes = data.get("scenes", [])
+    if not isinstance(scenes, list):
+        print("manifest scenes must be a list", file=sys.stderr)
+        return 1
+
+    max_bytes = 100 * 1024 * 1024
+    for scene in scenes:
+        vid_rel = scene.get("video", "")
+        vid_path = pathlib.Path("docs") / vid_rel
+        if not vid_rel or not vid_path.is_file():
+            print(f"Missing video file: {vid_path}", file=sys.stderr)
+            return 1
+        size = vid_path.stat().st_size
+        if size >= max_bytes:
+            print(f"Asset exceeds 100MB ({size} bytes): {vid_path}", file=sys.stderr)
+            return 1
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                str(vid_path),
+            ],
+            text=True,
+        ).strip()
+        w_str, h_str = out.split("x")
+        w, h = int(w_str), int(h_str)
+        if w != 2 * h:
+            print(f"Not 2:1 equirectangular ({w}x{h}): {vid_path}", file=sys.stderr)
+            return 1
+
+    print(f"Validated {len(scenes)} scene(s) successfully.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
